@@ -1,0 +1,15 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+pandas
+openpyxl
+requests
+rdkit
+periodictable
+
+# Interpolation (scipy splines/RBF, sklearn GMM). matplotlib is NOT needed —
+# the original script imported it but never plotted; charts are drawn client-side.
+numpy
+scipy
+scikit-learn
+pywin32; sys_platform == "win32"
