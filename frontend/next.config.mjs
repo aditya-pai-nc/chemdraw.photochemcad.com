@@ -1,11 +1,14 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  // Static export: `next build` emits plain HTML/JS into ./out, which the
-  // FastAPI backend serves the same way it used to serve Vite's ./dist.
-  // Node is a build-time dependency only — nothing runs it in production.
-  output: 'export',
-  images: { unoptimized: true },
-  reactStrictMode: true
+  // Runs as a Node server (`next start`), not a static export: the browser
+  // talks only to Next, and app/api/[...path] proxies to FastAPI server-side.
+  // Route handlers cannot exist in an `output: 'export'` build.
+  reactStrictMode: true,
+  // Uploads pass straight through the proxy as a stream, but Next still caps
+  // the body it will accept for a route handler.
+  experimental: {
+    proxyTimeout: 1000 * 60 * 30
+  }
 }
 
 export default nextConfig

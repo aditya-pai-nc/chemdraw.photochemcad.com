@@ -1,11 +1,10 @@
 import type { ChemDrawStatus, PipelineEvent } from './types'
 
-// Empty in production: the static export is served by FastAPI, so /api is
-// same-origin. In dev it points at uvicorn (see .env.development).
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? ''
-
+// Always same-origin. The browser never calls FastAPI directly — Next's
+// app/api/[...path] route handler proxies to it server-side, so the Python
+// service can stay bound to localhost.
 export function apiUrl(path: string): string {
-  return `${API_BASE}${path}`
+  return path
 }
 
 export async function readError(res: Response): Promise<string> {

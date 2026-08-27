@@ -8,13 +8,22 @@ The backend still drives **ChemDraw via COM**, so real processing requires a **W
 
 ```
 chemdraw.photochemcad.com/
-├── backend/     FastAPI + the original 3-stage Python pipeline
-└── frontend/    Next.js (App Router) UI (home → processing → results)
+├── backend/     FastAPI: ChemDraw pipeline + spectral interpolation
+└── frontend/    Next.js (App Router) UI + server-side API proxy
 ```
 
-The frontend is a **static export** (`output: 'export'`), so Node is a build-time
-dependency only. `next build` writes plain HTML/JS to `frontend/out`, which FastAPI
-serves itself — the production server runs one Python process and nothing else.
+**The browser never calls FastAPI directly.** It talks only to Next; Next's
+`app/api/[...path]/route.ts` proxies every `/api/*` call to FastAPI server-side.
+So FastAPI binds to `127.0.0.1` and is never reachable from the internet, there is
+no CORS to configure, and auth or rate limiting has one place to live.
+
+```
+browser ──▶ nginx :443 ──▶ next start :3000 ──▶ uvicorn 127.0.0.1:8000 ──▶ worker.py ──▶ ChemDraw
+                             (UI + /api proxy)      (localhost only)
+```
+
+The proxy streams in both directions: SSE progress arrives live, and .xlsx/.zip
+downloads are never buffered in Node.
 
 ## Run locally
 
@@ -37,10 +46,9 @@ npm install
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000). In dev the UI calls the API
-directly at `http://127.0.0.1:8000` via `NEXT_PUBLIC_API_BASE` (see
-`frontend/.env.development`); FastAPI's CORS middleware already allows it. No dev
-proxy is involved. In production the variable is unset, so `/api` is same-origin.
+Open [http://localhost:3000](http://localhost:3000). Next proxies `/api/*` to
+uvicorn using `CHEMDRAW_API_URL` (see `frontend/.env.example`; copy it to
+`.env.local`). Same code path in dev and production — nothing special to switch.
 
 ## ChemDraw queue
 
@@ -61,6 +69,28 @@ waiting removes it from the line without ever starting ChemDraw.
 This is per-process state, which is another reason the server must run with
 `--workers 1`.
 
+## Spectral interpolation
+
+Ported from `ChemDrawAutomationScripts/interpolation.py` — the algorithms are
+byte-identical; only its unused matplotlib import was dropped, since charts are
+drawn in the browser.
+
+Upload a `.txt`/`.tsv`/`.csv`/`.xlsx`/`.xls` file (2 columns = wavelength +
+coefficient, 3 columns = id + wavelength + coefficient) and every compound is
+interpolated with **cubic spline, Akima spline, linear, RBF (Gaussian), and a
+Gaussian Mixture Model**. Each is then verified by the "generated points only"
+technique from `VERIFICATION_TECHNIQUE.md` — predict the measured points using
+*only* the generated ones — and ranked by MSE.
+
+Interpolation needs no ChemDraw and no Windows, so it deliberately does **not**
+use the ChemDraw queue; it runs in worker threads (`CHEMDRAW_INTERP_CONCURRENCY`,
+default 2) so the event loop stays responsive.
+
+- `POST /api/interpolation` (file + step_size), `GET /api/interpolation/{id}`
+- `GET /api/interpolation/{id}/events` — SSE progress
+- `GET /api/interpolation/{id}/compounds/{compound_id}` — series for the charts
+- `GET /api/interpolation/{id}/excel` — the workbook
+
 ## Pipeline (unchanged)
 
 1. **CDX → CDXML** — ChemDraw COM opens the file and saves XML
@@ -69,19 +99,40 @@ This is per-process state, which is another reason the server must run with
 
 Output download is a ZIP of CDXML, `split_molecules/`, `mol_files/`, `images/`, and `*_compounds.xlsx`.
 
-## Production (Windows)
+## Production
 
-Build the UI once (on any machine with Node), then copy the whole project to the
-Windows box and run only the Python side:
+Two services on the same host:
 
 ```bash
-cd frontend && npm run build     # emits frontend/out
-cd ../backend && uvicorn app:app --host 0.0.0.0 --port 8000 --workers 1
+# 1. API — localhost only, single worker
+cd backend && venv/bin/uvicorn app:app --host 127.0.0.1 --port 8000 --workers 1
+
+# 2. UI + proxy
+cd frontend && npm run build && CHEMDRAW_API_URL=http://127.0.0.1:8000 npm start
 ```
 
-`--workers 1` is required: job state lives in an in-memory dict in `jobs.py`, so a
-second worker would not see jobs created by the first. If `frontend/out` exists,
-FastAPI serves the UI at `/` and the API at `/api`.
+`--workers 1` is required: job state and the ChemDraw queue live in memory in
+`jobs.py`, so a second worker would not see the first one's jobs.
 
-ChemDraw COM automation needs an **interactive desktop session** — run uvicorn from
-a logged-in user via Task Scheduler ("At log on"), not as a Windows Service.
+Put nginx in front of port 3000 for TLS, and set `proxy_buffering off` on `/api/`
+or the live progress stream will arrive in one lump at the end.
+
+**ChemDraw needs Windows and an interactive desktop session** — run uvicorn from a
+logged-in user via Task Scheduler ("At log on"), never as a Windows Service, which
+starts in Session 0 with no desktop. Interpolation has no such requirement and runs
+anywhere. The two halves can also be split across hosts: point `CHEMDRAW_API_URL`
+at a Windows box over a private network.
+
+### Environment
+
+| Variable | Where | Default | Meaning |
+|---|---|---|---|
+| `CHEMDRAW_API_URL` | frontend | `http://127.0.0.1:8000` | FastAPI address the proxy calls |
+| `CHEMDRAW_DATA_DIR` | backend | `backend/data/jobs` | ChemDraw job output |
+| `CHEMDRAW_INTERP_DIR` | backend | `backend/data/interpolation` | Interpolation output |
+| `CHEMDRAW_MAX_QUEUE` | backend | `20` | Max jobs in the ChemDraw line |
+| `CHEMDRAW_INTERP_CONCURRENCY` | backend | `2` | Parallel interpolation jobs |
+| `CHEMDRAW_CORS_ORIGINS` | backend | *(unset)* | Only if exposing the API to a browser directly |
+
+Neither `data/` directory is ever cleaned up — add a scheduled job to delete
+folders older than a week.

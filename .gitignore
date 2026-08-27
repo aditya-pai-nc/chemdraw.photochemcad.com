@@ -9,6 +9,6 @@ __pycache__/
 backend/data/
 node_modules/
 frontend/.next/
-frontend/out/
 frontend/next-env.d.ts
 frontend/tsconfig.tsbuildinfo
+frontend/.env.local
