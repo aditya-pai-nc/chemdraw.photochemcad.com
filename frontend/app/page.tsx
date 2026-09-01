@@ -84,11 +84,35 @@ export default function Page(): JSX.Element {
         setStageMessage(event.message)
         addLog('info', `[Stage ${event.stage}/${event.total}] ${event.message}`)
         break
-      case 'compound':
+      case 'compound': {
         setTotalCompounds(event.total)
-        setCompounds((prev) => [...prev, { name: event.name, match: event.match, index: event.index }])
-        addLog('info', `  ${event.match}  ${event.name}`)
+        // Each compound is reported twice — once after ChemDraw/RDKit/PubChem
+        // and again after the AI pass — so the row is replaced in place. Pushing
+        // would list every compound twice, once with its AI verdict still blank.
+        const row: CompoundRow = {
+          name: event.name,
+          match: event.match,
+          inchikeyMatch: event.inchikeyMatch,
+          aiMatch: event.aiMatch,
+          index: event.index,
+          aiDone: event.stage === 'ai'
+        }
+        setCompounds((prev) => {
+          const at = prev.findIndex((c) => c.index === row.index)
+          if (at === -1) return [...prev, row]
+          const next = [...prev]
+          next[at] = row
+          return next
+        })
+        addLog(
+          'info',
+          event.stage === 'ai'
+            ? `  AI ${event.aiMatch}  ${event.name}` +
+                (event.aiTotal ? ` (${event.aiProgress}/${event.aiTotal})` : '')
+            : `  ${event.match} formula  ${event.inchikeyMatch} InChIKey  ${event.name}`
+        )
         break
+      }
       case 'log':
         addLog(event.level, event.message)
         break

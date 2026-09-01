@@ -1,4 +1,4 @@
-import type { ChemDrawStatus, PipelineEvent } from './types'
+import type { AiStatus, ChemDrawStatus, PipelineEvent } from './types'
 
 // Always same-origin. The browser never calls FastAPI directly — Next's
 // app/api/[...path] route handler proxies to it server-side, so the Python
@@ -89,6 +89,25 @@ export async function getQueue(): Promise<QueueSnapshot> {
   return res.json() as Promise<QueueSnapshot>
 }
 
+/** What the backend reports for one InChIKey → PubChem → structure round trip. */
+export interface InchiKeyReport {
+  requested_inchikey: string
+  normalized_inchikey: string | null
+  valid_inchikey: boolean
+  found: boolean
+  /** 'InChIKey' for an exact hit, 'InChIKey skeleton' for a connectivity-only one. */
+  matched_on: string | null
+  cid: number | null
+  pubchem: Record<string, unknown> | null
+  structure: Record<string, unknown> | null
+  recomputed_inchikey: string | null
+  round_trip: 'exact' | 'skeleton' | 'mismatch' | 'unknown'
+  round_trip_ok: boolean
+  message: string | null
+  elapsed_seconds: number | null
+  chemdraw_required?: boolean
+}
+
 /** Live-connection state of a job's event stream. */
 export type StreamStatus = 'connecting' | 'open' | 'reconnecting' | 'closed'
 
@@ -122,4 +141,30 @@ export function subscribeToJob(
   }
 
   return () => source.close()
+}
+
+export async function getAiStatus(): Promise<AiStatus> {
+  const res = await fetch(apiUrl('/api/ai'))
+  if (!res.ok) throw new Error(await readError(res))
+  return res.json() as Promise<AiStatus>
+}
+
+/**
+ * Resolve an InChIKey through PubChem and get the structure back, rebuilt and
+ * verified. Needs neither ChemDraw nor Windows, so it also serves as the way to
+ * check the PubChem half of the pipeline from a machine that cannot run it.
+ */
+export async function resolveInchiKey(inchikey: string, save = false): Promise<InchiKeyReport> {
+  const query = save ? '?save=true' : ''
+  const res = await fetch(apiUrl(`/api/inchikey/${encodeURIComponent(inchikey)}${query}`))
+  if (!res.ok) throw new Error(await readError(res))
+  return res.json() as Promise<InchiKeyReport>
+}
+
+/** The same flow against a compound whose answer is already known. */
+export async function runInchiKeySelfTest(inchikey?: string): Promise<InchiKeyReport> {
+  const query = inchikey ? `?inchikey=${encodeURIComponent(inchikey)}` : ''
+  const res = await fetch(apiUrl(`/api/inchikey/selftest${query}`))
+  if (!res.ok) throw new Error(await readError(res))
+  return res.json() as Promise<InchiKeyReport>
 }

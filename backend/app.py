@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import zipfile
 from pathlib import Path
 
@@ -13,13 +14,27 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+# Must come before ai_identify: that module turns several settings into constants
+# the moment it is imported, so a .env loaded after it would arrive too late.
+import config  # noqa: F401  (imported for its side effect)
+
+import ai_identify
+import pubchem
+from inchi_tools import normalize_inchikey
 from interpolation_jobs import InterpolationManager
 from jobs import JobManager, QueueFullError, check_chemdraw
 
 manager = JobManager()
 interpolation_manager = InterpolationManager()
+
+# Structures downloaded by the InChIKey endpoints when ?save=true.
+INCHIKEY_DIR = Path(
+    os.environ.get("CHEMDRAW_INCHIKEY_DIR", Path(__file__).resolve().parent / "data" / "inchikey")
+)
+INCHIKEY_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="ChemDraw Processor", version="1.0.0")
 app.add_middleware(
@@ -265,6 +280,86 @@ async def download_interpolation_excel(job_id: str) -> FileResponse:
         filename=f"interpolation_results_{stem}.xlsx",
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+
+# ---------------------------------------------------------------------------
+# InChIKey → PubChem → structure
+# ---------------------------------------------------------------------------
+# None of this touches ChemDraw, so unlike the pipeline it runs anywhere. That
+# is the point: the InChIKey half of the enrichment can be exercised and trusted
+# on a Mac, while ChemDraw itself needs Windows and cannot even start there.
+# The calls are blocking HTTP, so they go to a worker thread rather than
+# stalling the event loop and every SSE stream hanging off it.
+
+
+@app.get("/api/ai")
+async def ai_status() -> dict:
+    """Whether AI identification and consensus are configured, and with which models."""
+    return ai_identify.status()
+
+
+@app.get("/api/ai/selftest")
+async def ai_selftest(smiles: str | None = None, caption: str | None = None) -> dict:
+    """
+    Put both models through a compound whose answer is already known.
+
+    Renders a structure with RDKit instead of ChemDraw, so this verifies the
+    credentials, the image path, the JSON contract and the consensus step on a
+    machine that cannot run the pipeline at all. Costs one Opus and one Sonnet
+    request per call.
+    """
+    report = await run_in_threadpool(
+        ai_identify.selftest,
+        smiles or "CC(=O)Oc1ccccc1C(=O)O",
+        caption or "compound 1a",
+    )
+    if not report.get("status", {}).get("enabled"):
+        raise HTTPException(status_code=409, detail=report.get("message") or "AI is not configured.")
+    return report
+
+
+@app.get("/api/inchikey/selftest")
+async def inchikey_selftest(inchikey: str | None = None, save: bool = False) -> dict:
+    """
+    Run the whole InChIKey flow against a compound whose answer is already known.
+
+    Push a known key into PubChem, pull the structure back, rebuild it in RDKit,
+    and recompute the key: if it comes back changed, the structure the pipeline
+    would have used is not the one it asked for. Defaults to aspirin; pass
+    `?inchikey=` for any other key, and `?save=true` to keep the MOL file.
+    """
+    key = inchikey or pubchem.DEFAULT_SELFTEST_KEY
+    save_path = str(INCHIKEY_DIR / f"{key}.mol") if save else None
+    report = await run_in_threadpool(pubchem.selftest, key, save_path)
+    report["chemdraw_required"] = False
+    return report
+
+
+@app.get("/api/inchikey/{inchikey}")
+async def resolve_inchikey(inchikey: str, save: bool = False) -> dict:
+    """
+    Resolve one InChIKey through PubChem and hand back the rebuilt structure.
+
+    Falls back to the 14-character skeleton when the full key misses, which is
+    the common case for a drawing whose stereocentres were left flat — the
+    response says which of the two matched, since they are not equally strong
+    evidence.
+    """
+    key = normalize_inchikey(inchikey)
+    if key is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"'{inchikey}' is not a valid InChIKey. Expected 14 letters, a hyphen, "
+                "10 letters, a hyphen, then 1 letter — e.g. BSYNRYMUTXBXSQ-UHFFFAOYSA-N."
+            ),
+        )
+
+    save_path = str(INCHIKEY_DIR / f"{key}.mol") if save else None
+    report = await run_in_threadpool(pubchem.round_trip_inchikey, key, save_path)
+    if not report.get("found"):
+        raise HTTPException(status_code=404, detail=report.get("message") or "Not found in PubChem.")
+    return report
 
 
 class ExportedStaticFiles(StaticFiles):

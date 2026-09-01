@@ -47,7 +47,11 @@ export function ProcessingScreen({
     ? `${totalSeconds}s`
     : `${Math.floor(totalSeconds / 60)}m ${String(totalSeconds % 60).padStart(2, '0')}s`
   const matched = compounds.filter((c) => c.match === '✅').length
+  const keyMatched = compounds.filter((c) => c.inchikeyMatch === '✅' || c.inchikeyMatch === '🟡').length
   const failed = compounds.filter((c) => c.match === '❌').length
+  // The AI pass runs after every structure has been read, so its progress is
+  // tracked separately — the compound bar can sit at 100% while it is still going.
+  const aiDone = compounds.filter((c) => c.aiDone).length
 
   return (
     <div className="flex flex-col h-full px-6 py-5 gap-4">
@@ -138,7 +142,8 @@ export function ProcessingScreen({
           <div className="flex items-center justify-between text-xs text-slate-500">
             <span>Compounds: {compounds.length} / {totalCompounds}</span>
             <span className="flex items-center gap-2">
-              <span className="text-emerald-400">{matched} matched</span>
+              <span className="text-emerald-400">{matched} formula</span>
+              <span className="text-brand-400">{keyMatched} InChIKey</span>
               {failed > 0 && <span className="text-red-400">{failed} unmatched</span>}
             </span>
           </div>
@@ -148,6 +153,11 @@ export function ProcessingScreen({
               style={{ width: `${Math.min(100, (compounds.length / totalCompounds) * 100)}%` }}
             />
           </div>
+          {aiDone > 0 && aiDone < compounds.length && (
+            <div className="flex items-center justify-between text-xs text-violet-400/80">
+              <span>AI identification: {aiDone} / {compounds.length}</span>
+            </div>
+          )}
         </div>
       )}
 

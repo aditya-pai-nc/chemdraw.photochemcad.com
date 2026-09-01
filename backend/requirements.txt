@@ -7,6 +7,17 @@ requests
 rdkit
 periodictable
 
+# AI identification + consensus. Pillow converts ChemDraw's TIFF exports to PNG,
+# which is what the Messages API accepts. Both are optional at runtime: without
+# ANTHROPIC_API_KEY the pipeline skips the AI pass and fills those columns with "—".
+anthropic
+pillow
+
+# Reads backend/.env so the API key does not have to be exported by hand —
+# which matters most on Windows, where uvicorn is started by Task Scheduler and
+# inherits almost nothing. config.py falls back to its own parser without it.
+python-dotenv
+
 # Interpolation (scipy splines/RBF, sklearn GMM). matplotlib is NOT needed —
 # the original script imported it but never plotted; charts are drawn client-side.
 numpy

@@ -8,6 +8,12 @@ import json
 import os
 import traceback
 
+# The worker inherits the API server's environment, but it is also launched on
+# its own (--check-chemdraw, or by hand), so it loads the .env itself. This must
+# precede any import that reads configuration — hence the local imports further
+# down rather than module-level ones.
+import config  # noqa: F401  (imported for its side effect)
+
 
 def emit(obj: dict) -> None:
     """Write a JSON event line to stdout and flush immediately."""

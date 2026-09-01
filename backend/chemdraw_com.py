@@ -88,3 +88,128 @@ def connect_chemdraw() -> Tuple[object, str]:
         f"Could not connect to ChemDraw COM. Python arch={arch}. "
         f"Tried ProgIDs: {detail}"
     )
+
+
+# ---------------------------------------------------------------------------
+# InChI straight out of ChemDraw
+# ---------------------------------------------------------------------------
+
+# ChemDraw exposes its clipboard/export formats by MIME type on the document's
+# object collection. Which of these a given install answers to varies by version
+# and by whether the InChI plug-in shipped with it, so every one is tried.
+CHEMDRAW_INCHI_MIME_TYPES = ("chemical/x-inchi", "chemical/x-inchi-key")
+CHEMDRAW_MOLFILE_MIME_TYPES = ("chemical/x-mdl-molfile", "chemical/x-mdl-molfile-v3000")
+
+
+def _objects_data(doc, mime: str):
+    """
+    Read one export format off a document.
+
+    ChemDraw's COM surface is not consistent across versions: some expose
+    `Objects.Data(mime)` as a parameterised property, others only
+    `Objects.GetData(mime)`, and pywin32 surfaces the difference as a plain
+    AttributeError or TypeError. Both spellings are tried before giving up.
+    """
+    objects = doc.Objects
+    for attempt in ("Data", "GetData"):
+        try:
+            accessor = getattr(objects, attempt)
+        except Exception:
+            continue
+        try:
+            value = accessor(mime)
+        except Exception:
+            continue
+        if value:
+            return str(value)
+    return None
+
+
+def export_inchi_from_document(doc, scratch_inchi_path: str | None = None) -> dict:
+    """
+    Get ChemDraw's own InChI for an open document.
+
+    This exists so the workbook can carry two *independently produced* InChIKeys
+    for the same drawing — ChemDraw's and RDKit's. When they agree, the structure
+    survived the ChemDraw → MOL → RDKit handoff intact. When they disagree, the
+    handoff lost or changed something, and that is worth knowing before any of
+    the downstream matching is believed.
+
+    Three routes are tried, strongest first, and the one that worked is recorded
+    in `source` — because the third route is not really an independent opinion
+    and a researcher must be able to tell:
+
+      "chemdraw-inchi"   ChemDraw's InChI export. Genuinely independent.
+      "chemdraw-file"    ChemDraw's Save As .inchi. Also independent.
+      "chemdraw-molfile" ChemDraw's MOL, converted by RDKit. NOT independent —
+                         it shares RDKit's InChI generator, so agreement with
+                         the RDKit column proves nothing about ChemDraw.
+
+    Never raises: a document ChemDraw will not export an InChI for still has to
+    produce a usable row.
+    """
+    import os
+
+    from inchi_tools import inchi_from_molblock, inchikey_from_inchi, parse_inchi_text
+
+    report = {"inchi": None, "inchikey": None, "source": None, "attempts": [], "error": None}
+
+    def record(route: str, outcome: str) -> None:
+        report["attempts"].append(f"{route}: {outcome}")
+
+    # 1. ChemDraw's InChI export.
+    for mime in CHEMDRAW_INCHI_MIME_TYPES:
+        try:
+            raw = _objects_data(doc, mime)
+        except Exception as exc:
+            record(mime, f"error ({exc})")
+            continue
+        if not raw:
+            record(mime, "not supported")
+            continue
+        inchi, key = parse_inchi_text(raw)
+        if inchi or key:
+            report.update({"inchi": inchi, "inchikey": key or inchikey_from_inchi(inchi),
+                           "source": "chemdraw-inchi"})
+            record(mime, "ok")
+            return report
+        record(mime, "returned nothing usable")
+
+    # 2. Save As .inchi, then read the file back.
+    if scratch_inchi_path:
+        try:
+            doc.SaveAs(os.path.abspath(scratch_inchi_path))
+            if os.path.isfile(scratch_inchi_path):
+                with open(scratch_inchi_path, "r", encoding="utf-8", errors="replace") as fh:
+                    inchi, key = parse_inchi_text(fh.read())
+                if inchi or key:
+                    report.update({"inchi": inchi, "inchikey": key or inchikey_from_inchi(inchi),
+                                   "source": "chemdraw-file"})
+                    record("SaveAs .inchi", "ok")
+                    return report
+                record("SaveAs .inchi", "file held no InChI")
+            else:
+                record("SaveAs .inchi", "no file written")
+        except Exception as exc:
+            record("SaveAs .inchi", f"error ({exc})")
+
+    # 3. ChemDraw's MOL block through RDKit. Weakest route — see the docstring.
+    for mime in CHEMDRAW_MOLFILE_MIME_TYPES:
+        try:
+            molblock = _objects_data(doc, mime)
+        except Exception as exc:
+            record(mime, f"error ({exc})")
+            continue
+        if not molblock:
+            record(mime, "not supported")
+            continue
+        inchi, key, warning = inchi_from_molblock(molblock)
+        if inchi:
+            report.update({"inchi": inchi, "inchikey": key, "source": "chemdraw-molfile",
+                           "error": warning})
+            record(mime, "ok (via RDKit — not an independent InChI)")
+            return report
+        record(mime, f"RDKit could not convert it ({warning})")
+
+    report["error"] = "ChemDraw produced no InChI. Tried: " + "; ".join(report["attempts"])
+    return report
