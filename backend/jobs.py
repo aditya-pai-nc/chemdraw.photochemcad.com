@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import traceback
@@ -71,7 +72,10 @@ class Job:
     cancelled: bool = False
     excel_path: Optional[str] = None
     compound_count: int = 0
-    proc: Optional[asyncio.subprocess.Process] = None
+    # subprocess.Popen — not asyncio.create_subprocess_exec. Uvicorn on Windows
+    # uses SelectorEventLoop, which raises empty NotImplementedError for the
+    # asyncio subprocess APIs.
+    proc: Optional[subprocess.Popen[bytes]] = None
     condition: asyncio.Condition = field(default_factory=asyncio.Condition)
     # Last queue position sent to the client, so the same one is not repeated.
     announced_position: int = -2
@@ -291,36 +295,52 @@ class JobManager:
 
     async def _run_worker(self, job: Job) -> None:
         env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                _python_executable(),
-                str(WORKER_PATH),
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=str(BACKEND_DIR),
-                env=env,
-            )
-        except Exception as exc:
-            await self.emit(job, {"type": "error", "message": f"Failed to start pipeline worker: {exc}"})
-            return
-
-        job.proc = proc
         cmd = json.dumps({
             "cmd": "process",
             "cdx_path": str(job.cdx_path),
             "output_dir": str(job.output_dir),
         })
 
+        try:
+            # Use Popen via a worker thread. asyncio.create_subprocess_exec is
+            # NotImplementedError on Windows under uvicorn's SelectorEventLoop,
+            # which surfaced in the UI as "Failed to start pipeline worker: ".
+            proc = await asyncio.to_thread(
+                subprocess.Popen,
+                [_python_executable(), str(WORKER_PATH)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=str(BACKEND_DIR),
+                env=env,
+            )
+        except Exception as exc:
+            detail = str(exc) or repr(exc)
+            await self.emit(job, {
+                "type": "error",
+                "message": f"Failed to start pipeline worker: {type(exc).__name__}: {detail}",
+            })
+            return
+
+        job.proc = proc
         assert proc.stdin is not None
-        proc.stdin.write((cmd + "\n").encode("utf-8"))
-        await proc.stdin.drain()
-        proc.stdin.close()
+        try:
+            await asyncio.to_thread(proc.stdin.write, (cmd + "\n").encode("utf-8"))
+            await asyncio.to_thread(proc.stdin.close)
+        except Exception as exc:
+            proc.kill()
+            detail = str(exc) or repr(exc)
+            await self.emit(job, {
+                "type": "error",
+                "message": f"Failed to send command to pipeline worker: {type(exc).__name__}: {detail}",
+            })
+            job.proc = None
+            return
 
         async def read_stderr() -> None:
             assert proc.stderr is not None
             while True:
-                line = await proc.stderr.readline()
+                line = await asyncio.to_thread(proc.stderr.readline)
                 if not line:
                     return
                 text = line.decode("utf-8", errors="replace").strip()
@@ -330,33 +350,21 @@ class JobManager:
         stderr_task = asyncio.create_task(read_stderr())
 
         assert proc.stdout is not None
-        buffer = ""
         while True:
-            chunk = await proc.stdout.read(4096)
-            if not chunk:
+            line = await asyncio.to_thread(proc.stdout.readline)
+            if not line:
                 break
-            buffer += chunk.decode("utf-8", errors="replace")
-            lines = buffer.split("\n")
-            buffer = lines.pop() or ""
-            for line in lines:
-                trimmed = line.strip()
-                if not trimmed:
-                    continue
-                try:
-                    event = json.loads(trimmed)
-                    await self.emit(job, event)
-                except json.JSONDecodeError:
-                    await self.emit(job, {"type": "log", "level": "info", "message": trimmed})
-
-        if buffer.strip():
-            trimmed = buffer.strip()
+            trimmed = line.decode("utf-8", errors="replace").strip()
+            if not trimmed:
+                continue
             try:
-                await self.emit(job, json.loads(trimmed))
+                event = json.loads(trimmed)
+                await self.emit(job, event)
             except json.JSONDecodeError:
                 await self.emit(job, {"type": "log", "level": "info", "message": trimmed})
 
         await stderr_task
-        code = await proc.wait()
+        code = await asyncio.to_thread(proc.wait)
         job.proc = None
 
         if not job.done:
@@ -380,10 +388,10 @@ class JobManager:
             await self.queue.announce()
             return
 
-        if job.proc and job.proc.returncode is None:
+        if job.proc and job.proc.poll() is None:
             job.proc.kill()
             try:
-                await job.proc.wait()
+                await asyncio.to_thread(job.proc.wait)
             except Exception:
                 pass
 
@@ -422,44 +430,31 @@ class JobManager:
                 return
 
 
-async def check_chemdraw() -> dict[str, Any]:
-    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+def _probe_chemdraw() -> dict[str, Any]:
+    """
+    Probe ChemDraw in this process.
+
+    The previous implementation spawned worker.py and killed it after 8s. Under
+    uvicorn --reload on Windows that subprocess often failed with an empty
+    COM error, so the UI said ChemDraw was missing even when it was installed.
+    """
     try:
-        proc = await asyncio.create_subprocess_exec(
-            _python_executable(),
-            str(WORKER_PATH),
-            "--check-chemdraw",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=str(BACKEND_DIR),
-            env=env,
-        )
+        from chemdraw_com import connect_chemdraw
+        app, progid = connect_chemdraw()
+        version = getattr(app, "Version", "unknown")
+        # Do not Quit() — this is a health check, not a session teardown.
+        return {
+            "available": True,
+            "version": str(version),
+            "progid": progid,
+            "reason": None,
+        }
     except Exception as exc:
-        return {"available": False, "reason": str(exc)}
+        return {
+            "available": False,
+            "reason": str(exc) or repr(exc),
+        }
 
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=8)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        return {"available": False, "reason": "Timed out while checking ChemDraw availability."}
 
-    output = stdout.decode("utf-8", errors="replace")
-    err = stderr.decode("utf-8", errors="replace").strip()
-    lines = [line.strip() for line in output.split("\n") if line.strip()]
-    for line in reversed(lines):
-        try:
-            result = json.loads(line)
-            return {
-                "available": bool(result.get("available")),
-                "version": result.get("version"),
-                "progid": result.get("progid"),
-                "reason": result.get("reason"),
-            }
-        except json.JSONDecodeError:
-            continue
-
-    return {
-        "available": False,
-        "reason": err or output.strip() or "Could not parse ChemDraw check output from Python backend.",
-    }
+async def check_chemdraw() -> dict[str, Any]:
+    return await asyncio.to_thread(_probe_chemdraw)

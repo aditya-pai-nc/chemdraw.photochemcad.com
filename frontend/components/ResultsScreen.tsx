@@ -1,30 +1,46 @@
 'use client'
 
 import type { JSX } from 'react'
-import { FileSpreadsheet, FolderArchive, RotateCcw, CheckCircle2, XCircle, AlertCircle, MinusCircle, CircleAlert } from 'lucide-react'
+import { FileSpreadsheet, FolderArchive, RotateCcw, CheckCircle2, XCircle, AlertCircle, MinusCircle } from 'lucide-react'
 import type { CompoundRow, MatchSymbol } from '@/lib/types'
 import { archiveUrl, excelUrl } from '@/lib/api'
 
-/**
- * One verdict cell. A skeleton match ('🟡') is shown as its own state rather
- * than being rounded to a pass or a fail: it means the compound is right but the
- * stereochemistry was left undrawn, which is a drawing convention, not an error
- * — and lumping it in either direction is what the extra columns exist to avoid.
- */
-function Verdict({ value, pending }: { value: MatchSymbol; pending?: boolean }): JSX.Element {
-  if (pending) {
-    return <span className="flex items-center justify-center text-slate-600">·&thinsp;·&thinsp;·</span>
-  }
+/** One verdict cell: agree, disagree, or nothing to compare. */
+function Verdict({ value }: { value: MatchSymbol }): JSX.Element {
   switch (value) {
     case '✅':
       return <span className="flex items-center justify-center text-emerald-400" title="Match"><CheckCircle2 className="w-3.5 h-3.5" /></span>
-    case '🟡':
-      return <span className="flex items-center justify-center text-amber-400" title="Same skeleton, different stereochemistry or protonation"><CircleAlert className="w-3.5 h-3.5" /></span>
     case '❌':
       return <span className="flex items-center justify-center text-red-400" title="No match"><XCircle className="w-3.5 h-3.5" /></span>
     default:
       return <span className="flex items-center justify-center text-slate-600" title="Nothing to compare"><MinusCircle className="w-3.5 h-3.5" /></span>
   }
+}
+
+/**
+ * The curator's verdict, shown only for compounds that did not match exactly.
+ * A matched compound never reaches curation, so its cell says so rather than
+ * showing an empty state that reads like a failure.
+ */
+function Curated({
+  verdict, matched
+}: { verdict?: 'yes' | 'no' | 'uncertain' | null; matched: boolean }): JSX.Element {
+  if (matched) {
+    return <span className="flex items-center justify-center text-slate-700 text-[10px]">not needed</span>
+  }
+  if (!verdict) {
+    return <span className="flex items-center justify-center text-slate-600">·&thinsp;·&thinsp;·</span>
+  }
+  const style = {
+    yes: ['text-emerald-400', 'same compound'],
+    no: ['text-red-400', 'differs'],
+    uncertain: ['text-amber-400', 'uncertain']
+  }[verdict]
+  return (
+    <span className={`flex items-center justify-center text-[10px] ${style[0]}`} title={style[1]}>
+      {style[1]}
+    </span>
+  )
 }
 
 interface Props {
@@ -38,14 +54,16 @@ export function ResultsScreen({
   jobId, compounds, errorMessage, onReset
 }: Props): JSX.Element {
   const total = compounds.length
-  const matched = compounds.filter((c) => c.match === '✅').length
-  const keyMatched = compounds.filter((c) => c.inchikeyMatch === '✅').length
-  const keyPartial = compounds.filter((c) => c.inchikeyMatch === '🟡').length
-  const aiMatched = compounds.filter((c) => c.aiMatch === '✅').length
-  const aiRan = compounds.filter((c) => c.aiDone).length
-  // The reason for reporting the InChIKey column separately: how many compounds
-  // the structure hash identified that formula-and-weight alone did not.
-  const keyOnlyWins = compounds.filter((c) => c.match !== '✅' && c.inchikeyMatch === '✅').length
+  const formulaMatched = compounds.filter((c) => c.match === '✅').length
+  const matched = compounds.filter((c) => c.inchikeyMatch === '✅').length
+  const unmatched = total - matched
+  const curated = compounds.filter((c) => c.curated).length
+  // Of the curated ones, how many the model still judged to be the same
+  // compound — a salt form or a tautomer is the usual reason.
+  const curatedSame = compounds.filter((c) => c.curated === 'yes').length
+  // The reason for reporting the structural column separately: how many
+  // compounds canonical matching confirmed that formula-and-weight alone did not.
+  const structureOnlyWins = compounds.filter((c) => c.match !== '✅' && c.inchikeyMatch === '✅').length
   const rate = (n: number) => (total > 0 ? Math.round((n / total) * 100) : 0)
   const success = !errorMessage && !!jobId
 
@@ -76,25 +94,22 @@ export function ResultsScreen({
             <p className="text-xs text-slate-500 mt-0.5">Compounds</p>
           </div>
           <div className="rounded-xl bg-slate-900 border border-slate-800 px-4 py-3 text-center">
-            <p className="text-2xl font-bold text-slate-200">{matched}</p>
+            <p className="text-2xl font-bold text-slate-200">{formulaMatched}</p>
             <p className="text-xs text-slate-500 mt-0.5">Formula match</p>
-            <p className="text-[10px] text-slate-600">{rate(matched)}%</p>
+            <p className="text-[10px] text-slate-600">{rate(formulaMatched)}%</p>
           </div>
           <div className="rounded-xl bg-emerald-900/20 border border-emerald-800/40 px-4 py-3 text-center">
-            <p className="text-2xl font-bold text-emerald-400">
-              {keyMatched}
-              {keyPartial > 0 && <span className="text-base text-amber-400"> +{keyPartial}</span>}
-            </p>
+            <p className="text-2xl font-bold text-emerald-400">{matched}</p>
             <p className="text-xs text-emerald-600 mt-0.5">InChIKey match</p>
-            <p className="text-[10px] text-slate-600">
-              {rate(keyMatched)}%{keyPartial > 0 && ` · ${keyPartial} skeleton`}
-            </p>
+            <p className="text-[10px] text-slate-600">{rate(matched)}%</p>
           </div>
           <div className="rounded-xl bg-violet-900/20 border border-violet-800/40 px-4 py-3 text-center">
-            <p className="text-2xl font-bold text-violet-300">{aiRan > 0 ? aiMatched : '—'}</p>
-            <p className="text-xs text-violet-500/80 mt-0.5">AI match</p>
+            <p className="text-2xl font-bold text-violet-300">{curated > 0 ? curated : '—'}</p>
+            <p className="text-xs text-violet-500/80 mt-0.5">Curated</p>
             <p className="text-[10px] text-slate-600">
-              {aiRan > 0 ? `${rate(aiMatched)}% of ${aiRan} run` : 'AI pass not run'}
+              {curated > 0
+                ? `of ${unmatched} unmatched · ${curatedSame} same compound`
+                : unmatched > 0 ? 'curation not run' : 'nothing to curate'}
             </p>
           </div>
         </div>
@@ -105,25 +120,20 @@ export function ResultsScreen({
           <div className="flex justify-between text-xs text-slate-500">
             <span>Identification rate</span>
             <span className="font-semibold text-slate-300">
-              {rate(keyMatched + keyPartial)}% by InChIKey · {rate(matched)}% by formula
+              {rate(matched)}% by structure · {rate(formulaMatched)}% by formula
             </span>
           </div>
           <div className="h-2 rounded-full bg-slate-800 overflow-hidden flex">
             <div
               className="h-full bg-emerald-500 transition-all duration-500"
-              style={{ width: `${rate(keyMatched)}%` }}
-              title={`${keyMatched} exact InChIKey matches`}
-            />
-            <div
-              className="h-full bg-amber-500 transition-all duration-500"
-              style={{ width: `${rate(keyPartial)}%` }}
-              title={`${keyPartial} matched on skeleton only`}
+              style={{ width: `${rate(matched)}%` }}
+              title={`${matched} exact structural matches`}
             />
           </div>
-          {keyOnlyWins > 0 && (
+          {structureOnlyWins > 0 && (
             <p className="text-xs text-emerald-500/80">
-              The InChIKey found {keyOnlyWins} compound{keyOnlyWins === 1 ? '' : 's'} that
-              formula and weight alone did not.
+              The canonical SMILES check confirmed {structureOnlyWins} compound
+              {structureOnlyWins === 1 ? '' : 's'} that formula and weight alone did not.
             </p>
           )}
         </div>
@@ -162,7 +172,7 @@ export function ResultsScreen({
           <div className="px-4 py-2.5 bg-slate-900 border-b border-slate-800 flex items-center justify-between shrink-0">
             <span className="text-xs font-semibold text-slate-500 uppercase tracking-widest">Compounds</span>
             <span className="text-[10px] text-slate-600">
-              Manual review column is in the workbook
+              Curated rows are on the workbook&apos;s second sheet
             </span>
           </div>
           <div className="overflow-y-auto max-h-72">
@@ -172,8 +182,8 @@ export function ResultsScreen({
                   <th className="text-left px-4 py-2 text-slate-500 font-medium w-8">#</th>
                   <th className="text-left px-4 py-2 text-slate-500 font-medium">Compound Name</th>
                   <th className="text-center px-3 py-2 text-slate-500 font-medium w-20" title="PubChem formula and weight">Formula</th>
-                  <th className="text-center px-3 py-2 text-slate-500 font-medium w-20" title="PubChem InChIKey — a hash of the structure">InChIKey</th>
-                  <th className="text-center px-3 py-2 text-slate-500 font-medium w-20" title="Claude's independent identification, against the drawn structure">AI</th>
+                  <th className="text-center px-3 py-2 text-slate-500 font-medium w-20" title="Canonical SMILES from ChemDraw vs from PubChem">InChIKey Match</th>
+                  <th className="text-center px-3 py-2 text-slate-500 font-medium w-24" title="Curator's verdict for compounds that did not match exactly">Curated</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800/50">
@@ -183,7 +193,7 @@ export function ResultsScreen({
                     <td className="px-4 py-2 text-slate-300 font-medium">{c.name}</td>
                     <td className="px-3 py-2"><Verdict value={c.match} /></td>
                     <td className="px-3 py-2"><Verdict value={c.inchikeyMatch} /></td>
-                    <td className="px-3 py-2"><Verdict value={c.aiMatch} pending={!c.aiDone} /></td>
+                    <td className="px-3 py-2"><Curated verdict={c.curated} matched={c.inchikeyMatch === '✅'} /></td>
                   </tr>
                 ))}
               </tbody>

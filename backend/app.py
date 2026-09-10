@@ -17,11 +17,11 @@ from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-# Must come before ai_identify: that module turns several settings into constants
+# Must come before ai_curate: that module turns several settings into constants
 # the moment it is imported, so a .env loaded after it would arrive too late.
 import config  # noqa: F401  (imported for its side effect)
 
-import ai_identify
+import ai_curate
 import pubchem
 from inchi_tools import normalize_inchikey
 from interpolation_jobs import InterpolationManager
@@ -294,27 +294,25 @@ async def download_interpolation_excel(job_id: str) -> FileResponse:
 
 @app.get("/api/ai")
 async def ai_status() -> dict:
-    """Whether AI identification and consensus are configured, and with which models."""
-    return ai_identify.status()
+    """Whether the curation pass is configured, and with which model."""
+    return ai_curate.status()
 
 
 @app.get("/api/ai/selftest")
-async def ai_selftest(smiles: str | None = None, caption: str | None = None) -> dict:
+async def ai_selftest() -> dict:
     """
-    Put both models through a compound whose answer is already known.
+    Put the curator through a mismatch whose answer is already known.
 
-    Renders a structure with RDKit instead of ChemDraw, so this verifies the
-    credentials, the image path, the JSON contract and the consensus step on a
-    machine that cannot run the pipeline at all. Costs one Opus and one Sonnet
-    request per call.
+    Aspirin as drawn against salicylic acid from PubChem: same family, different
+    formula, so a working curator must reject the match. Verifies the
+    credentials, the JSON contract and the InChIKey guard on a machine that
+    cannot run the pipeline at all. Costs one small-model request per call.
     """
-    report = await run_in_threadpool(
-        ai_identify.selftest,
-        smiles or "CC(=O)Oc1ccccc1C(=O)O",
-        caption or "compound 1a",
-    )
+    report = await run_in_threadpool(ai_curate.selftest)
     if not report.get("status", {}).get("enabled"):
-        raise HTTPException(status_code=409, detail=report.get("message") or "AI is not configured.")
+        raise HTTPException(
+            status_code=409, detail=report.get("message") or "Curation is not configured."
+        )
     return report
 
 

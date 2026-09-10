@@ -25,13 +25,9 @@ def check_chemdraw() -> dict:
         from chemdraw_com import connect_chemdraw
         app, progid = connect_chemdraw()
         version = getattr(app, "Version", "unknown")
-        try:
-            app.Quit()
-        except Exception:
-            pass
         return {"type": "chemdraw_status", "available": True, "version": str(version), "progid": progid}
     except Exception as e:
-        return {"type": "chemdraw_status", "available": False, "reason": str(e)}
+        return {"type": "chemdraw_status", "available": False, "reason": str(e) or repr(e)}
 
 
 def run_pipeline(cdx_path: str, output_dir: str) -> None:

@@ -4,7 +4,7 @@ Web version of the ChemDraw desktop app: upload a `.cdx` file, split molecules, 
 
 The backend still drives **ChemDraw via COM**, so real processing requires a **Windows** machine with ChemDraw installed. The UI can be developed on macOS; the pipeline will report that ChemDraw is missing.
 
-The InChIKey → PubChem → structure flow and the AI identification pass need neither, so both
+The InChIKey → PubChem → structure flow and the curation pass need neither, so both
 can be exercised and verified on a Mac — see [Verifying it without ChemDraw](#verifying-it-without-chemdraw)
 and `/api/ai/selftest`.
 
@@ -113,14 +113,32 @@ default 2) so the event loop stays responsive.
 
 1. **CDX → CDXML** — ChemDraw COM opens the file and saves XML
 2. **Split molecules** — parse CDXML into one file per structure
-3. **Structure & PubChem** — ChemDraw exports MOL, TIFF and its own **InChI**; RDKit
-   computes SMILES/formula/weight and a second, independent **InChIKey**; PubChem is
-   searched by InChIKey first and the winning structure is downloaded and rebuilt locally
-4. **Identify & reconcile** — Claude identifies each compound from the drawing, then a
-   second model reconciles every source into one answer *(skipped when no API key is set)*
+3. **Gather & enrich** — ChemDraw hands over **five representations** of each molecule
+   (SMILES, SLN, InChI, InChIKey, MOL text); RDKit reads its MOL text for a canonical
+   SMILES, formula, weight and an independent InChIKey; PubChem is searched by InChIKey
+   first, every candidate CID is swept, and the winning structure is downloaded and rebuilt
+4. **Curate the unmatched** — only compounds that did not match exactly go to a small model,
+   which reconciles the two sources onto a second worksheet *(skipped when no API key is set)*
 
 Output download is a ZIP of CDXML, `split_molecules/`, `mol_files/`, `images/`,
-`pubchem_structures/`, `chemdraw_inchi/`, and `*_compounds.xlsx`.
+`pubchem_structures/`, and `*_compounds.xlsx`.
+
+### Getting the five representations out of ChemDraw
+
+Each format is tried two ways, and the workbook records which one worked in
+`ChemDraw Format Routes`:
+
+| Route | How | Cost |
+|---|---|---|
+| `com` | `Objects.Data(mime)` / `Objects.GetData(mime)` | Fast, works with the window hidden — but not every build answers to it |
+| `keys` | `Ctrl+A`, `Alt+E`, `o`, then `s`/`l`/`n`/`k`/`m` off the clipboard | Works wherever the menu does, but needs ChemDraw raised and the machine left alone |
+
+Both doors reach the same internal converters, so they should agree. COM is tried for all
+five first; the window is only raised if something is still missing, so the focus cost is
+not paid unless it is actually needed. The clipboard is emptied before every copy —
+otherwise a wrong mnemonic leaves the *previous* format sitting there and it would be read
+back as a success. Mnemonics are configurable (`CHEMDRAW_COPYAS_KEYS`) because they shift
+between ChemDraw releases.
 
 ## InChIKey matching
 
@@ -130,19 +148,34 @@ therefore searches PubChem in order of how much each route can be trusted — **
 InChIKey → InChIKey skeleton → name → SMILES** — and records in `PubChem Source` which one
 actually produced the answer.
 
-Two InChIKeys are gathered for every molecule, from ChemDraw's own InChI export and from
-RDKit reading ChemDraw's MOL. When they agree, the structure survived the ChemDraw → MOL →
-RDKit handoff intact; when they disagree, the handoff changed something, and
-`ChemDraw vs RDKit InChIKey` says so before any downstream match is believed. ChemDraw's
-InChI is tried three ways (`Objects.Data("chemical/x-inchi")`, `SaveAs .inchi`, then its MOL
-block through RDKit) because the COM surface differs by version; `ChemDraw InChI Source`
-names the route that worked — the third one is *not* independent of RDKit and is labelled
-as such.
+Two InChIKeys are gathered for every molecule: ChemDraw's own, and RDKit's from ChemDraw's
+MOL text. When they agree, the structure survived the ChemDraw → MOL → RDKit handoff intact;
+when they disagree, the handoff changed something, and `ChemDraw vs RDKit InChIKey` says so
+before any downstream match is believed.
 
-The **14-character skeleton** is the first block of the key, covering connectivity only. A
-drawing whose stereocentres were left flat — very common in a scheme — produces a different
-full key from the same compound in PubChem while sharing the skeleton. Those are matched and
-reported as `🟡` rather than being passed off as exact or thrown away as failures.
+### Matching on canonical forms
+
+A SMILES string is not a structure — it is one of many ways to write one. `OC(=O)c1ccccc1`
+and `c1ccccc1C(O)=O` are the same molecule and share not a single character. ChemDraw and
+PubChem each write their own, so both are put through RDKit's canonical writer before they
+are compared; comparing the raw strings answers a question nobody asked.
+
+A compound is **matched only on exact agreement** — an identical canonical SMILES, or an
+identical InChIKey across all three blocks. A shared 14-character skeleton with different
+stereochemistry is reported as `🟡` and counted as **unmatched**, so it reaches curation
+rather than being quietly accepted.
+
+### Sweeping every candidate
+
+One search term routinely resolves to several PubChem records — a parent, a salt, a labelled
+isotopologue, a later duplicate deposition — and they are not equally complete. Taking the
+first and accepting its blanks throws away data sitting in the next record down.
+
+So every route collects all its candidates, keeps the best one as the answer (it decides the
+CID, and therefore which compound the row is about), and fills any empty field from the first
+candidate that has it. Every such borrow is named in `PubChem Borrowed Fields` and
+`Reference Fields Borrowed` — a CAS number taken from a *different* record may describe a
+different salt, and the row has to be able to say so.
 
 ### Verifying it without ChemDraw
 
@@ -163,57 +196,55 @@ curl 'localhost:8000/api/inchikey/RYYVLZVUVIJVGH-UHFFFAOYSA-N?save=true'   # kee
 PubChem's own connection table are two different artefacts, and if they disagree then the
 structure the backend is about to use is not the structure that was asked for.
 
-## AI identification and consensus
+## Curating the unmatched
 
-Two models, deliberately asymmetric:
+Nothing here tries to work out what a molecule is — ChemDraw already read the structure and
+PubChem was already searched every way it can be. The only question left, for the rows where
+those two disagreed or where PubChem returned nothing, is what the researcher should write
+down and why it did not match.
 
-| | Model | Sees | Job |
-|---|---|---|---|
-| **Identifier** | `claude-opus-5` + web search | caption, structure image, molecular formula | works out what the molecule is |
-| **Referee** | `claude-sonnet-5` | everything, including *how* PubChem was found | reconciles the sources into one answer |
+So a **small model** (`claude-haiku-4-5` by default) is given the *relevant* fields from both
+sides — not the full property sweep, which is mostly 3D descriptors and fingerprints that have
+no bearing on whether two structures are the same compound — and asked to reconcile them. It
+returns a verdict (`same_compound`: yes / no / uncertain), curated values, and a concrete
+discrepancy, likely cause and recommended action.
 
-The identifier is **not** given the SMILES that ChemDraw and RDKit derived. An opinion that
-has already been shown the answer is not evidence, and its whole value in the vote is that
-it arrives independently — so when it agrees with PubChem, the agreement means something.
+**A model is never trusted for an InChIKey.** A key is a hash; it cannot be reasoned out, only
+copied. The curator may only quote a key that already appears in the evidence, and anything
+else it returns is discarded — with the rejection recorded in `Curation Error`, so the attempt
+is visible rather than silently dropped.
 
-**A model is never trusted for an InChIKey.** A key is a hash; it cannot be reasoned out,
-only computed or recalled, and a model asked for one will produce something that looks
-exactly right and is not. The identifier is asked for a SMILES and the key is computed from
-it locally with RDKit. Anything it volunteers is kept in `AI Reported InChIKey`, clearly
-labelled, and never used for matching.
+Curated values are written to their **own worksheet**, never merged into the machine-derived
+columns, so no AI-authored value can be mistaken for something ChemDraw or PubChem said.
 
-The referee weighs the sources by strength rather than by majority — an exact InChIKey hit
-outranks a name hit, and two sources agreeing because one was derived from the other is not
-corroboration — and sets `Consensus Needs Review` whenever a human should look.
-
-ChemDraw's TIFF exports are converted to PNG and downscaled to 1568px before being sent, so
-a 35 MB export becomes a ~100 KB payload. The AI pass runs several compounds at a time
-(`CHEMDRAW_AI_CONCURRENCY`) because, unlike ChemDraw, it has no single-instance constraint.
-
-Without `ANTHROPIC_API_KEY` the whole pass is skipped and the AI columns read `—`;
-everything else works exactly as before.
+Without `ANTHROPIC_API_KEY` the pass is skipped; the second sheet still lists every unmatched
+compound and why, just without a curated answer.
 
 ```bash
-curl localhost:8000/api/ai            # is it configured, and with which models
-curl localhost:8000/api/ai/selftest   # both models against a known compound, no ChemDraw
+curl localhost:8000/api/ai            # is it configured, and with which model
+curl localhost:8000/api/ai/selftest   # curate a known mismatch, no ChemDraw
 ```
 
-## The three match columns
+## The match columns
 
 The workbook reports each verdict separately instead of collapsing them, because how often
-the InChIKey route succeeds where the formula route fails is exactly the question the extra
+the structural route succeeds where the formula route fails is exactly the question the extra
 column exists to answer.
 
 | Column | Asks | Strength |
 |---|---|---|
 | `Match?` | Does PubChem's formula match, and its weight to within 0.5? | Two molecules can weigh the same and be unrelated |
-| `InChIKey Match?` | Does the structure hash match? | Conclusive — this *is* the structure |
-| `AI Match?` | Does Claude's independent identification match the drawing? | Catches drawings that are self-consistent but wrong |
+| `Structure Match?` | Do the canonical SMILES or the InChIKeys agree? | Conclusive — this *is* the structure |
+| `Matched` | `Yes` only on exact structural agreement | The gate: `No` sends the compound to curation |
 | `Manual Match` | *(left empty)* | The researcher's own verdict |
 
 `✅` agreement · `🟡` same skeleton, different stereochemistry or protonation · `❌`
-disagreement · `—` nothing to compare. Each machine verdict has a matching `… Detail`
-column giving the reason in words, so no tick has to be taken on faith.
+disagreement · `—` nothing to compare. `Structure Match Detail` gives the reason in words,
+naming which comparison decided it, so no tick has to be taken on faith.
+
+The second worksheet, **Unmatched - AI curated**, carries one row per unmatched compound:
+why it was unmatched (written locally, not by the model), the curator's verdict, its curated
+fields, and enough context from sheet 1 to read on its own.
 
 ## Production
 
@@ -253,14 +284,15 @@ Frontend values follow the existing `frontend/.env.local` convention.
 | `CHEMDRAW_MAX_QUEUE` | backend | `20` | Max jobs in the ChemDraw line |
 | `CHEMDRAW_INTERP_CONCURRENCY` | backend | `2` | Parallel interpolation jobs |
 | `CHEMDRAW_CORS_ORIGINS` | backend | *(unset)* | Only if exposing the API to a browser directly |
-| `ANTHROPIC_API_KEY` | backend | *(unset)* | Enables the AI pass. Without it those columns read `—` |
+| `ANTHROPIC_API_KEY` | backend | *(unset)* | Enables curation. Without it the second sheet says why each compound is unmatched, with no curated answer |
 | `CHEMDRAW_AI_ENABLED` | backend | `auto` | `auto` = on when a key is present; `0` forces it off |
-| `CHEMDRAW_AI_MODEL` | backend | `claude-opus-5` | The identifier — needs to be able to do research |
-| `CHEMDRAW_AI_CONSENSUS_MODEL` | backend | `claude-sonnet-5` | The referee — only weighs evidence it is given |
-| `CHEMDRAW_AI_CONCURRENCY` | backend | `4` | Compounds identified in parallel |
-| `CHEMDRAW_AI_WEB_SEARCH` | backend | `1` | Lets the identifier look compounds up |
-| `CHEMDRAW_AI_EFFORT` | backend | `high` | Identifier thinking depth (`low`…`max`) |
-| `CHEMDRAW_AI_MAX_IMAGE_PX` | backend | `1568` | Long edge the TIFF is downscaled to |
+| `CHEMDRAW_CURATE_MODEL` | backend | `claude-haiku-4-5-20251001` | The curator — only weighs evidence it is given |
+| `CHEMDRAW_CURATE_CONCURRENCY` | backend | `4` | Unmatched compounds curated in parallel |
+| `CHEMDRAW_CURATE_EFFORT` | backend | *(unset)* | Only for a model that supports it; the request degrades automatically |
+| `CHEMDRAW_KEYS_FALLBACK` | backend | `1` | Drive Edit > Copy As when COM will not give up a format |
+| `CHEMDRAW_COPYAS_KEYS` | backend | `smiles=s,sln=l,…` | Menu mnemonics, if they differ in your build |
+| `CHEMDRAW_PUBCHEM_MAX_CANDIDATES` | backend | `25` | Candidate CIDs swept to fill missing fields |
+| `CHEMDRAW_PUBCHEM_MAX_REFERENCE` | backend | `5` | Candidates walked for CAS / synonyms / Wikipedia |
 | `CHEMDRAW_INCHIKEY_DIR` | backend | `backend/data/inchikey` | Where `?save=true` writes structures |
 
 Neither `data/` directory is ever cleaned up — add a scheduled job to delete

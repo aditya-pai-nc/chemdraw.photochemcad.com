@@ -7,7 +7,7 @@ started from Windows Task Scheduler "At log on", and a scheduled task inherits
 almost nothing. A `.env` file beside the code is the practical way to give the
 server an API key there.
 
-Import this module **first**, before `ai_identify` or anything else that reads
+Import this module **first**, before `ai_curate` or anything else that reads
 configuration at import time — several of those values become module constants
 the moment they are read, so a `.env` loaded afterwards would arrive too late.
 Real environment variables always win over the file, so a shell export or a

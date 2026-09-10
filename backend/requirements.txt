@@ -7,11 +7,10 @@ requests
 rdkit
 periodictable
 
-# AI identification + consensus. Pillow converts ChemDraw's TIFF exports to PNG,
-# which is what the Messages API accepts. Both are optional at runtime: without
-# ANTHROPIC_API_KEY the pipeline skips the AI pass and fills those columns with "—".
+# Curation of the compounds that did not match. Optional at runtime: without
+# ANTHROPIC_API_KEY the pipeline skips the pass and the second worksheet records
+# the reason instead of a curated answer.
 anthropic
-pillow
 
 # Reads backend/.env so the API key does not have to be exported by hand —
 # which matters most on Windows, where uvicorn is started by Task Scheduler and

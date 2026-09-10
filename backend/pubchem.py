@@ -17,7 +17,7 @@ import os
 import re
 import time
 import urllib.parse
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
 import requests
@@ -99,12 +99,25 @@ class PubChemHit:
     source: str = "None"
     # What was actually sent to PubChem, so a surprising row can be re-run by hand.
     query: Optional[str] = None
-    # For a skeleton search: how many CIDs shared the connectivity block.
+    # How many CIDs the search returned in total.
     candidates: int = 0
+    # Every CID the search returned, best first. One InChIKey routinely resolves
+    # to several records — a parent, a salt, a labelled isotopologue — and they
+    # are not equally complete.
+    candidate_cids: list[int] = field(default_factory=list)
+    # field name -> the CID it was taken from, recorded only where that was NOT
+    # the primary CID. An empty dict means the first record answered everything.
+    field_sources: dict[str, int] = field(default_factory=dict)
     notes: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    def borrowed_summary(self) -> Optional[str]:
+        """`SMILES from CID 123; IUPACName from CID 456`, or None if nothing was."""
+        if not self.field_sources:
+            return None
+        return "; ".join(f"{name} from CID {cid}" for name, cid in self.field_sources.items())
 
     @classmethod
     def from_properties(cls, props: dict, source: str, query: str) -> "PubChemHit":
@@ -134,6 +147,111 @@ def _get_properties(url: str, timeout: int = 15) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Candidate sweeping
+# ---------------------------------------------------------------------------
+# A single search term routinely resolves to more than one PubChem record — a
+# parent compound, its hydrochloride, a deuterated analogue, a later duplicate
+# deposition — and those records are not equally complete. Taking the first one
+# and accepting its blanks throws away data that is sitting in the next record
+# down. So every route collects all its candidates, keeps the best one as the
+# answer, and fills any empty field from the first candidate that has it.
+
+MAX_CANDIDATES = int(os.environ.get("CHEMDRAW_PUBCHEM_MAX_CANDIDATES", "25"))
+
+# (attribute on PubChemHit, property name in PubChem's table, converter)
+_MERGE_SPEC: list[tuple[str, str, Any]] = [
+    ("formula", "MolecularFormula", None),
+    ("weight", "MolecularWeight", _as_weight),
+    ("smiles", "SMILES", None),
+    ("connectivity_smiles", "ConnectivitySMILES", None),
+    ("inchi", "InChI", None),
+    ("inchikey", "InChIKey", normalize_inchikey),
+    ("iupac_name", "IUPACName", None),
+    ("title", "Title", None),
+]
+
+
+def _cids_for(path: str) -> list[int]:
+    """Every CID a search path resolves to, in PubChem's own order."""
+    try:
+        _rate_limit()
+        r = requests.get(f"{BASE}/compound/{path}/cids/JSON", timeout=15)
+        r.raise_for_status()
+        cids = (r.json().get("IdentifierList") or {}).get("CID") or []
+    except Exception:
+        return []
+    out: list[int] = []
+    for c in cids:
+        try:
+            out.append(int(c))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _properties_for_cids(cids: list[int]) -> list[dict]:
+    """Look up several CIDs at once, returned in the order they were asked for."""
+    if not cids:
+        return []
+    joined = ",".join(str(c) for c in cids)
+    props = _get_properties(f"{BASE}/compound/cid/{joined}/property/{LOOKUP_PROPS}/JSON", timeout=30)
+    if not props:
+        return []
+    by_cid = {}
+    for entry in props:
+        try:
+            by_cid[int(entry.get("CID"))] = entry
+        except (TypeError, ValueError):
+            continue
+    return [by_cid[c] for c in cids if c in by_cid]
+
+
+def _merge_candidates(
+    props: list[dict], source: str, query: str, total_candidates: int | None = None
+) -> Optional[PubChemHit]:
+    """
+    Build one hit from an ordered list of candidate records.
+
+    The first record is the answer — it decides the CID, and therefore which
+    compound this row is about. The rest are only ever consulted for fields the
+    first one left empty, and every such borrow is recorded in `field_sources`,
+    so a value that came from a different record can never be mistaken for one
+    the primary record actually had.
+    """
+    if not props:
+        return None
+
+    hit = PubChemHit.from_properties(props[0], source, query)
+    hit.candidate_cids = [int(p["CID"]) for p in props if p.get("CID") is not None]
+    hit.candidates = total_candidates if total_candidates is not None else len(props)
+
+    # PubChem renamed CanonicalSMILES to SMILES; older records answer to either.
+    if not hit.smiles:
+        hit.smiles = props[0].get("CanonicalSMILES")
+
+    for attr, prop, convert in _MERGE_SPEC:
+        if getattr(hit, attr) not in (None, ""):
+            continue
+        for candidate in props[1:]:
+            raw = candidate.get(prop)
+            if prop == "SMILES" and raw in (None, ""):
+                raw = candidate.get("CanonicalSMILES")
+            if raw in (None, ""):
+                continue
+            value = convert(raw) if convert else raw
+            if value in (None, ""):
+                continue
+            setattr(hit, attr, value)
+            try:
+                hit.field_sources[attr] = int(candidate["CID"])
+            except (KeyError, TypeError, ValueError):
+                pass
+            break
+
+    return hit
+
+
+# ---------------------------------------------------------------------------
 # Lookups, most trustworthy first
 # ---------------------------------------------------------------------------
 
@@ -143,18 +261,28 @@ def query_by_inchikey(inchikey: str) -> Optional[PubChemHit]:
     Exact InChIKey lookup — the strongest identification PubChem can give.
 
     All three blocks must agree, so a hit means PubChem holds this exact
-    structure including stereochemistry and protonation state.
+    structure including stereochemistry and protonation state. Even an exact key
+    can resolve to several deposited records, so all of them are swept.
     """
     key = normalize_inchikey(inchikey)
     if not key:
         return None
-    props = _get_properties(f"{BASE}/compound/inchikey/{key}/property/{LOOKUP_PROPS}/JSON")
+
+    cids = _cids_for(f"inchikey/{key}")[:MAX_CANDIDATES]
+    props = _properties_for_cids(cids)
+    if not props:
+        # Some records answer the property endpoint but not the cids endpoint.
+        props = _get_properties(f"{BASE}/compound/inchikey/{key}/property/{LOOKUP_PROPS}/JSON")
     if not props:
         return None
-    return PubChemHit.from_properties(props[0], "InChIKey", key)
+
+    hit = _merge_candidates(props, "InChIKey", key, total_candidates=len(cids) or len(props))
+    if hit and hit.candidates > 1:
+        hit.notes = f"{hit.candidates} PubChem record(s) carry this exact InChIKey."
+    return hit
 
 
-def query_by_inchikey_skeleton(inchikey: str, max_candidates: int = 25) -> Optional[PubChemHit]:
+def query_by_inchikey_skeleton(inchikey: str, max_candidates: int = MAX_CANDIDATES) -> Optional[PubChemHit]:
     """
     Fall back to the 14-character connectivity block.
 
@@ -169,22 +297,14 @@ def query_by_inchikey_skeleton(inchikey: str, max_candidates: int = 25) -> Optio
     if not skeleton:
         return None
 
-    try:
-        _rate_limit()
-        r = requests.get(f"{BASE}/compound/inchikey/{skeleton}/cids/JSON", timeout=15)
-        r.raise_for_status()
-        cids = (r.json().get("IdentifierList") or {}).get("CID") or []
-    except Exception:
-        return None
-
+    cids = _cids_for(f"inchikey/{skeleton}")
     if not cids:
         return None
 
     # Lowest CIDs are the oldest, best-curated records — usually the parent
     # compound rather than a salt, isotopologue or later-deposited variant.
-    shortlist = sorted(int(c) for c in cids)[:max_candidates]
-    joined = ",".join(str(c) for c in shortlist)
-    props = _get_properties(f"{BASE}/compound/cid/{joined}/property/{LOOKUP_PROPS}/JSON", timeout=30)
+    shortlist = sorted(cids)[:max_candidates]
+    props = _properties_for_cids(shortlist)
     if not props:
         return None
 
@@ -201,13 +321,13 @@ def query_by_inchikey_skeleton(inchikey: str, max_candidates: int = 25) -> Optio
             int(entry.get("CID") or 10**12),
         )
 
-    best = sorted(props, key=score)[0]
-    hit = PubChemHit.from_properties(best, "InChIKey skeleton", skeleton)
-    hit.candidates = len(cids)
-    hit.notes = (
-        f"Matched on connectivity only ({skeleton}); {len(cids)} PubChem "
-        "compound(s) share this skeleton."
-    )
+    ranked = sorted(props, key=score)
+    hit = _merge_candidates(ranked, "InChIKey skeleton", skeleton, total_candidates=len(cids))
+    if hit:
+        hit.notes = (
+            f"Matched on connectivity only ({skeleton}); {len(cids)} PubChem "
+            "compound(s) share this skeleton."
+        )
     return hit
 
 
@@ -216,10 +336,18 @@ def query_by_name(name: str) -> Optional[PubChemHit]:
     if not name:
         return None
     safe = urllib.parse.quote(name, safe="")
-    props = _get_properties(f"{BASE}/compound/name/{safe}/property/{LOOKUP_PROPS}/JSON")
+
+    cids = _cids_for(f"name/{safe}")[:MAX_CANDIDATES]
+    props = _properties_for_cids(cids)
+    if not props:
+        props = _get_properties(f"{BASE}/compound/name/{safe}/property/{LOOKUP_PROPS}/JSON")
     if not props:
         return None
-    return PubChemHit.from_properties(props[0], "Name", name)
+
+    hit = _merge_candidates(props, "Name", name, total_candidates=len(cids) or len(props))
+    if hit and hit.candidates > 1:
+        hit.notes = f"The name '{name}' matched {hit.candidates} PubChem record(s)."
+    return hit
 
 
 def query_by_smiles(smiles: str) -> Optional[PubChemHit]:
@@ -227,11 +355,16 @@ def query_by_smiles(smiles: str) -> Optional[PubChemHit]:
     if not smiles:
         return None
     safe = urllib.parse.quote(smiles, safe="")
-    props = _get_properties(f"{BASE}/compound/smiles/{safe}/property/{LOOKUP_PROPS}/JSON")
+
+    cids = _cids_for(f"smiles/{safe}")[:MAX_CANDIDATES]
+    props = _properties_for_cids(cids)
+    if not props:
+        props = _get_properties(f"{BASE}/compound/smiles/{safe}/property/{LOOKUP_PROPS}/JSON")
     if not props:
         return None
-    hit = PubChemHit.from_properties(props[0], "SMILES", smiles)
-    if not hit.smiles:
+
+    hit = _merge_candidates(props, "SMILES", smiles, total_candidates=len(cids) or len(props))
+    if hit and not hit.smiles:
         hit.smiles = smiles
     return hit
 
@@ -549,3 +682,61 @@ def fetch_wikipedia_url_by_cid(cid) -> Optional[str]:
         except Exception:
             continue
     return None
+
+
+# How many candidate CIDs the reference sweep will walk before giving up. Each
+# extra candidate costs three pug_view round trips, so this is deliberately much
+# tighter than MAX_CANDIDATES — the point is to rescue a missing CAS number, not
+# to crawl every duplicate deposition.
+MAX_REFERENCE_CANDIDATES = int(os.environ.get("CHEMDRAW_PUBCHEM_MAX_REFERENCE", "5"))
+
+
+def fetch_reference_fields(cids: list[int]) -> dict[str, Any]:
+    """
+    CAS, synonyms, Wikipedia and the property table, filled across candidates.
+
+    These live in pug_view rather than the property table, and coverage is
+    patchy: a CAS number is very often absent from the record an InChIKey
+    resolves to while sitting on the next candidate down. So each field is taken
+    from the first candidate that actually has it, and `sources` records where
+    each one came from — a CAS borrowed from a *different* record describes a
+    different compound, and the row has to be able to say so.
+    """
+    result: dict[str, Any] = {
+        "properties": None, "cas": None, "synonyms": None,
+        "wikipedia": None, "iupac_name": None, "sources": {},
+    }
+    if not cids:
+        return result
+
+    primary = cids[0]
+    shortlist = cids[:MAX_REFERENCE_CANDIDATES]
+
+    result["properties"] = fetch_properties_by_cid(primary)
+    if result["properties"]:
+        result["iupac_name"] = result["properties"].get("IUPACName")
+
+    for name, fetch in (
+        ("cas", fetch_cas_by_cid),
+        ("synonyms", fetch_synonyms_by_cid),
+        ("wikipedia", fetch_wikipedia_url_by_cid),
+    ):
+        for cid in shortlist:
+            value = fetch(cid)
+            if value:
+                result[name] = value
+                if cid != primary:
+                    result["sources"][name] = cid
+                break
+
+    # The property table is per-CID too, so a missing IUPAC name is worth
+    # chasing through the candidates before giving up on it.
+    if not result["iupac_name"]:
+        for cid in shortlist[1:]:
+            props = fetch_properties_by_cid(cid)
+            if props and props.get("IUPACName"):
+                result["iupac_name"] = props["IUPACName"]
+                result["sources"]["iupac_name"] = cid
+                break
+
+    return result

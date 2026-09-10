@@ -8,7 +8,8 @@ import type { StreamStatus } from '@/lib/api'
 const STAGE_LABELS = [
   { label: 'CDX → CDXML', desc: 'Opening ChemDraw and converting file' },
   { label: 'Split Molecules', desc: 'Extracting individual structures' },
-  { label: 'Process & Enrich', desc: 'RDKit + PubChem enrichment' }
+  { label: 'Gather & Enrich', desc: 'ChemDraw formats, RDKit, PubChem' },
+  { label: 'Curate Unmatched', desc: 'Reconciling compounds that did not match' }
 ]
 
 interface Props {
@@ -47,11 +48,12 @@ export function ProcessingScreen({
     ? `${totalSeconds}s`
     : `${Math.floor(totalSeconds / 60)}m ${String(totalSeconds % 60).padStart(2, '0')}s`
   const matched = compounds.filter((c) => c.match === '✅').length
-  const keyMatched = compounds.filter((c) => c.inchikeyMatch === '✅' || c.inchikeyMatch === '🟡').length
-  const failed = compounds.filter((c) => c.match === '❌').length
-  // The AI pass runs after every structure has been read, so its progress is
-  // tracked separately — the compound bar can sit at 100% while it is still going.
-  const aiDone = compounds.filter((c) => c.aiDone).length
+  const keyMatched = compounds.filter((c) => c.inchikeyMatch === '✅').length
+  const failed = compounds.filter((c) => c.inchikeyMatch !== '✅').length
+  // Curation runs after every structure has been read, and only over the
+  // compounds that did not match — so the compound bar can sit at 100% while
+  // it is still going, and its denominator is the unmatched count, not the total.
+  const curated = compounds.filter((c) => c.curated).length
 
   return (
     <div className="flex flex-col h-full px-6 py-5 gap-4">
@@ -142,8 +144,8 @@ export function ProcessingScreen({
           <div className="flex items-center justify-between text-xs text-slate-500">
             <span>Compounds: {compounds.length} / {totalCompounds}</span>
             <span className="flex items-center gap-2">
-              <span className="text-emerald-400">{matched} formula</span>
-              <span className="text-brand-400">{keyMatched} InChIKey</span>
+              <span className="text-slate-400">{matched} formula</span>
+              <span className="text-emerald-400">{keyMatched} structure</span>
               {failed > 0 && <span className="text-red-400">{failed} unmatched</span>}
             </span>
           </div>
@@ -153,9 +155,9 @@ export function ProcessingScreen({
               style={{ width: `${Math.min(100, (compounds.length / totalCompounds) * 100)}%` }}
             />
           </div>
-          {aiDone > 0 && aiDone < compounds.length && (
+          {curated > 0 && (
             <div className="flex items-center justify-between text-xs text-violet-400/80">
-              <span>AI identification: {aiDone} / {compounds.length}</span>
+              <span>Curating unmatched: {curated} / {failed}</span>
             </div>
           )}
         </div>

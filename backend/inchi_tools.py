@@ -58,6 +58,17 @@ AGREEMENT_LABELS = {
     "unknown": "Not enough data to compare",
 }
 
+# The same verdicts phrased without naming a method, for composing a detail line
+# that reports several comparisons at once — "canonical SMILES: exact InChIKey
+# match" is nonsense, and a researcher reading the column would rightly distrust
+# every other cell in the row.
+AGREEMENT_PHRASES = {
+    "exact": "identical",
+    "skeleton": "same skeleton, different stereochemistry or protonation",
+    "mismatch": "different structures",
+    "unknown": "not comparable",
+}
+
 
 def normalize_inchikey(value) -> Optional[str]:
     """Uppercase and strip a candidate key; None unless it is well-formed."""
@@ -180,6 +191,80 @@ def inchi_from_smiles(smiles: str) -> Tuple[Optional[str], Optional[str], Option
     if mol is None:
         return None, None, f"RDKit could not parse SMILES: {smiles}"
     return inchi_from_mol(mol)
+
+
+# ---------------------------------------------------------------------------
+# Canonicalisation
+# ---------------------------------------------------------------------------
+# A SMILES string is not a structure, it is one of many ways to write one:
+# "OC(=O)c1ccccc1" and "c1ccccc1C(O)=O" are the same molecule and share not a
+# single character. ChemDraw and PubChem each write their own, so comparing the
+# strings they hand over answers a question nobody asked. Both sides are put
+# through the same RDKit writer first, and only then compared.
+
+
+def canonical_smiles(smiles: str | None, isomeric: bool = True) -> Optional[str]:
+    """
+    Rewrite a SMILES in RDKit's canonical form, or None if it will not parse.
+
+    `isomeric=False` drops stereochemistry, which is how a flat-drawn
+    stereocentre is compared against a PubChem record that has one.
+    """
+    if not smiles or not str(smiles).strip():
+        return None
+    try:
+        mol = Chem.MolFromSmiles(str(smiles).strip())
+    except Exception:
+        return None
+    if mol is None:
+        return None
+    try:
+        return Chem.MolToSmiles(mol, isomericSmiles=isomeric)
+    except Exception:
+        return None
+
+
+def smiles_agreement(left: str | None, right: str | None) -> str:
+    """
+    Compare two SMILES through RDKit rather than as text.
+
+    Returns "exact" when the canonical isomeric forms match, "skeleton" when
+    they match only once stereochemistry is discarded, "mismatch" when both
+    parse and differ, and "unknown" when either side is missing or unparseable.
+    """
+    a_exact = canonical_smiles(left, isomeric=True)
+    b_exact = canonical_smiles(right, isomeric=True)
+    if not a_exact or not b_exact:
+        return "unknown"
+    if a_exact == b_exact:
+        return "exact"
+
+    a_flat = canonical_smiles(left, isomeric=False)
+    b_flat = canonical_smiles(right, isomeric=False)
+    if a_flat and b_flat and a_flat == b_flat:
+        return "skeleton"
+    return "mismatch"
+
+
+def canonical_smiles_match(left: str | None, right: str | None) -> tuple[str, str]:
+    """
+    (symbol, reason) for the one structural comparison the pipeline makes.
+
+    Both SMILES go through RDKit's canonical writer and are then compared as
+    strings. That is the whole rule: no skeleton tier, no stereo tolerance, no
+    falling back to a second opinion when the first is inconvenient. Either the
+    two structures write the same way or they do not.
+    """
+    a, b = canonical_smiles(left), canonical_smiles(right)
+    if not a and not b:
+        return MATCH_NA, "Neither side produced a usable SMILES."
+    if not a:
+        return MATCH_NA, "No usable SMILES from ChemDraw."
+    if not b:
+        return MATCH_NA, "No usable SMILES from PubChem."
+    if a == b:
+        return MATCH_YES, "Canonical SMILES are identical."
+    return MATCH_NO, "Canonical SMILES differ."
 
 
 def inchikey_from_inchi(inchi: str) -> Optional[str]:

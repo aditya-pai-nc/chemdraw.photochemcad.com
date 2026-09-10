@@ -86,17 +86,15 @@ export default function Page(): JSX.Element {
         break
       case 'compound': {
         setTotalCompounds(event.total)
-        // Each compound is reported twice — once after ChemDraw/RDKit/PubChem
-        // and again after the AI pass — so the row is replaced in place. Pushing
-        // would list every compound twice, once with its AI verdict still blank.
         const row: CompoundRow = {
           name: event.name,
           match: event.match,
           inchikeyMatch: event.inchikeyMatch,
-          aiMatch: event.aiMatch,
           index: event.index,
-          aiDone: event.stage === 'ai'
+          curated: null
         }
+        // Replaced in place rather than pushed: a stream that reconnects and
+        // replays would otherwise list every compound twice.
         setCompounds((prev) => {
           const at = prev.findIndex((c) => c.index === row.index)
           if (at === -1) return [...prev, row]
@@ -104,12 +102,23 @@ export default function Page(): JSX.Element {
           next[at] = row
           return next
         })
+        addLog('info', `  ${event.match} formula  ${event.inchikeyMatch} structure  ${event.name}`)
+        break
+      }
+      case 'curated': {
+        // Curation only visits compounds that did not match, so this annotates
+        // an existing row rather than creating one.
+        setCompounds((prev) => {
+          const at = prev.findIndex((c) => c.index === event.index)
+          if (at === -1) return prev
+          const next = [...prev]
+          next[at] = { ...next[at], curated: event.verdict ?? 'uncertain' }
+          return next
+        })
         addLog(
           'info',
-          event.stage === 'ai'
-            ? `  AI ${event.aiMatch}  ${event.name}` +
-                (event.aiTotal ? ` (${event.aiProgress}/${event.aiTotal})` : '')
-            : `  ${event.match} formula  ${event.inchikeyMatch} InChIKey  ${event.name}`
+          `  curated ${event.name} — same compound: ${event.verdict ?? 'unknown'}` +
+            ` (${event.progress}/${event.total})`
         )
         break
       }
