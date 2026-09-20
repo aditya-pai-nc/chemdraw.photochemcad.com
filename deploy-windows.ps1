@@ -374,18 +374,48 @@ npm run start >> "$LogDir\frontend.log" 2>&1
 # ---------------------------------------------------------------------------
 if (-not $SkipFirewall) {
     Step 'Firewall'
+
     $ruleName = "ChemDraw API $Port"
-    if ($exposed) {
-        if (-not (Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue)) {
-            New-NetFirewallRule -DisplayName $ruleName -Direction Inbound `
-                -Protocol TCP -LocalPort $Port -Action Allow | Out-Null
-            Ok "Opened inbound TCP $Port"
-        } else { Ok "Rule '$ruleName' already present" }
+    $rule = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
+
+    if ($rule) {
+        # Re-assert the port: an earlier run may have used a different one.
+        try {
+            $rule | Set-NetFirewallRule -Enabled True | Out-Null
+            $rule | Get-NetFirewallPortFilter | Where-Object { $_.LocalPort -ne "$Port" } | ForEach-Object {
+                $rule | Set-NetFirewallRule -LocalPort $Port | Out-Null
+            }
+        } catch {}
+        Ok "Inbound TCP $Port already allowed (rule '$ruleName')"
     } else {
-        Info "Bound to $BindHost, so no firewall rule is needed"
-        $stale = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
-        if ($stale) { Remove-NetFirewallRule -DisplayName $ruleName; Ok 'Removed a stale rule from an earlier exposed install' }
+        New-NetFirewallRule -DisplayName $ruleName `
+            -Description 'ChemDraw Processor API. Required when the UI is served from another host.' `
+            -Direction Inbound -Protocol TCP -LocalPort $Port `
+            -Action Allow -Profile Any | Out-Null
+        Ok "Opened inbound TCP $Port (rule '$ruleName')"
     }
+
+    if (-not $exposed) {
+        Info "uvicorn is bound to $BindHost, so nothing off-box can reach the port regardless."
+        Info 'The rule is harmless here and is ready if you later switch to -BindHost 0.0.0.0.'
+    }
+
+    # Windows Firewall is only the first of two on a cloud instance, and the
+    # second one is the usual reason a correct Windows setup still times out.
+    if ($exposed) {
+        Info ''
+        Info 'AWS Lightsail / EC2 has a SECOND firewall that Windows knows nothing about.'
+        Info "Open TCP $Port there too, or the port stays closed from outside:"
+        Info '  Lightsail : instance > Networking > IPv4 Firewall > Add rule'
+        Info '  EC2       : the instance security group > Inbound rules'
+        Info 'Restrict the source to your frontend where you can; the API token is the'
+        Info 'only other thing standing in front of this service.'
+    }
+}
+else {
+    Step 'Firewall'
+    Info '-SkipFirewall given; no firewall rule was created or changed.'
+    if ($exposed) { Warn "Port $Port may be closed to outside traffic until you open it manually." }
 }
 
 # ---------------------------------------------------------------------------
