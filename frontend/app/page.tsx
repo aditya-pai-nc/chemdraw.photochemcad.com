@@ -90,6 +90,10 @@ export default function Page(): JSX.Element {
           name: event.name,
           match: event.match,
           inchikeyMatch: event.inchikeyMatch,
+          casVerification: event.casVerification,
+          casDetail: event.casDetail,
+          casRn: event.casRn,
+          casLink: event.casLink,
           index: event.index,
           curated: null
         }
@@ -102,7 +106,8 @@ export default function Page(): JSX.Element {
           next[at] = row
           return next
         })
-        addLog('info', `  ${event.match} formula  ${event.inchikeyMatch} structure  ${event.name}`)
+        addLog('info', `  ${event.match} formula  ${event.inchikeyMatch} structure  ${event.name}` +
+          (event.casVerification ? ` · CAS: ${event.casVerification}` : ''))
         break
       }
       case 'curated': {

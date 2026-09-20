@@ -45,7 +45,7 @@ export function HomeScreen({
         </div>
         <h1 className="text-3xl font-bold text-white">ChemDraw Processor</h1>
         <p className="text-slate-400 text-sm max-w-md">
-          Upload a ChemDraw file (.cdx) to extract molecular structures, generate SMILES, and enrich with PubChem data — all in one click.
+          Upload a ChemDraw file (.cdx) to extract molecular structures, generate SMILES, enrich with PubChem data, and verify against CAS Common Chemistry when configured.
         </p>
       </div>
 

@@ -14,6 +14,13 @@ export const runtime = 'nodejs'
 
 const BACKEND_URL = process.env.CHEMDRAW_API_URL ?? 'http://127.0.0.1:8000'
 
+// Shared secret for the backend. Read server-side only and never exposed to the
+// browser: it is not NEXT_PUBLIC_, and this handler runs on the server. It
+// exists because the UI and FastAPI no longer have to share a host — once the
+// UI is on Vercel and the backend on a Windows box, "bound to localhost" stops
+// being the security model and every endpoint is otherwise open.
+const API_TOKEN = process.env.CHEMDRAW_API_TOKEN ?? ''
+
 // Request headers worth forwarding. `last-event-id` matters most: it is how a
 // reconnecting EventSource resumes instead of replaying the whole job.
 const FORWARD_REQUEST_HEADERS = ['content-type', 'accept', 'last-event-id', 'range']
@@ -32,6 +39,9 @@ async function proxy(request: NextRequest, path: string[]): Promise<Response> {
     const value = request.headers.get(name)
     if (value) headers.set(name, value)
   }
+  // Injected here rather than forwarded: a token the browser could send is a
+  // token the browser could read.
+  if (API_TOKEN) headers.set('x-chemdraw-token', API_TOKEN)
 
   const init: RequestInit & { duplex?: 'half' } = {
     method: request.method,
@@ -55,6 +65,17 @@ async function proxy(request: NextRequest, path: string[]): Promise<Response> {
     return Response.json(
       { detail: `Cannot reach the processing backend at ${BACKEND_URL}. ${detail}` },
       { status: 502 }
+    )
+  }
+
+  if (upstream.status === 401) {
+    return Response.json(
+      {
+        detail:
+          'The processing backend rejected this request. CHEMDRAW_API_TOKEN is missing ' +
+          'here or does not match the value set on the backend.'
+      },
+      { status: 401 }
     )
   }
 

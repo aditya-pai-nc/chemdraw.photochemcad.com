@@ -6,7 +6,7 @@ import './globals.css'
 export const metadata: Metadata = {
   title: 'PhotochemCAD Tools',
   description:
-    'Upload a ChemDraw file (.cdx) to extract molecular structures, generate SMILES, and enrich with PubChem data.'
+    'ChemDraw processing, spectral interpolation, and bulk chemical information from CAS numbers using PubChem and CAS Common Chemistry.'
 }
 
 export default function RootLayout({ children }: { children: ReactNode }) {

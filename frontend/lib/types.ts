@@ -5,9 +5,19 @@
  */
 export type MatchSymbol = '✅' | '❌' | '—'
 
+export type CasVerification = 'Verified' | 'Mismatch' | 'Not comparable' | 'Not found' |
+  'Unavailable' | 'Not configured' | 'Disabled' | 'Skipped'
+
+export interface CasResult {
+  casVerification?: CasVerification
+  casDetail?: string | null
+  casRn?: string | null
+  casLink?: string | null
+}
+
 export type PipelineEvent =
   | { type: 'stage'; stage: number; total: number; message: string }
-  | {
+  | (CasResult & {
       type: 'compound'
       name: string
       /** PubChem's formula equals the drawn formula, and its weight to within 0.5. */
@@ -16,7 +26,7 @@ export type PipelineEvent =
       inchikeyMatch: MatchSymbol
       index: number
       total: number
-    }
+    })
   | {
       /** One unmatched compound came back from the curation model. */
       type: 'curated'
@@ -36,12 +46,13 @@ export type PipelineEvent =
       outputDir: string
       matchCount?: number
       inchikeyMatchCount?: number
+      casVerifiedCount?: number
       curatedCount?: number
     }
   | { type: 'error'; message: string }
   | { type: 'chemdraw_status'; available: boolean; version?: string }
 
-export interface CompoundRow {
+export interface CompoundRow extends CasResult {
   name: string
   match: MatchSymbol
   inchikeyMatch: MatchSymbol

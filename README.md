@@ -1,6 +1,6 @@
 # ChemDraw Processor (web)
 
-Web version of the ChemDraw desktop app: upload a `.cdx` file, split molecules, enrich with PubChem, and download Excel plus generated files.
+Web version of the ChemDraw desktop app: upload a `.cdx` file, split molecules, enrich with PubChem, verify against CAS Common Chemistry, and download Excel plus generated files.
 
 The backend still drives **ChemDraw via COM**, so real processing requires a **Windows** machine with ChemDraw installed. The UI can be developed on macOS; the pipeline will report that ChemDraw is missing.
 
@@ -39,7 +39,7 @@ python -m venv venv
 # Windows: venv\Scripts\activate
 # macOS/Linux: source venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env      # optional — only the AI pass needs anything in it
+cp .env.example .env      # optional — keys enable AI curation and CAS verification
 uvicorn app:app --reload --port 8000
 ```
 
@@ -86,6 +86,60 @@ waiting removes it from the line without ever starting ChemDraw.
 
 This is per-process state, which is another reason the server must run with
 `--workers 1`.
+
+## Bulk chemical information extractor
+
+Open **Bulk CAS Extractor** in the navigation (`/bulk-cas`). This is an independent
+web app for extracting chemical data from a list of CAS numbers; it needs neither
+a ChemDraw installation nor an AI API key.
+
+Upload a TXT, CSV, TSV, XLSX or legacy XLS file (up to 2 MB and 500 entries).
+Lists of approximately 100 CAS numbers are supported. Use one number per line,
+or label a spreadsheet column `CAS RN`, `CAS Number` or `CAS No.` when the file
+also has names or other columns. Excel worksheets are read in order. Keep CAS
+cells formatted as **Text**, since Excel dates cannot reliably be turned back
+into the original CAS number. A downloadable three-compound sample is on the page.
+
+The extractor retrieves **molecular formula, molecular weight, SMILES, InChI,
+InChIKey, name, PubChem CID, and direct PubChem / CAS Common Chemistry links**.
+Input order and duplicates are preserved; duplicate CAS numbers reuse the same
+lookup. Invalid formats or check digits remain in the table with an explanation.
+Blank cells and lines beginning with `#` are skipped.
+
+Both databases are queried independently. The summary uses the CAS Common Chemistry
+record when one is available, otherwise PubChem. Each source's values stay together;
+missing values are not borrowed from a different substance. When a CAS lookup
+resolves to a current replacement RN, the source details record that RN. PubChem
+can return several candidates: the one whose canonical isomeric SMILES agrees with
+CAS is preferred; otherwise the first candidate is shown and candidates are noted.
+Structure disagreements, unavailable services and missing records are reported
+separately. Expand a table row to inspect each source's SMILES and InChI.
+
+Downloads include a **CSV summary** and an **Excel workbook** with `Compounds`,
+`Source records`, and `Read me` sheets. The workbook includes all source values,
+comparison rules and CAS attribution. Strings are written as literal Excel text;
+CSV entries beginning with formula-triggering characters receive a leading apostrophe.
+
+Bulk jobs run in background threads, one batch at a time, independently of the
+ChemDraw queue. The page displays progress and reconnects after a refresh. Stop
+finishes the current lookup, then offers downloads of completed entries. Completed
+results survive a backend restart; an interrupted active batch must be uploaded
+again. Results are stored under `backend/data/bulk_cas/` (or `CHEMDRAW_BULK_CAS_DIR`).
+
+CAS access uses the same backend `CAS_API_KEY` as ChemDraw verification. If CAS is
+not configured or unavailable, PubChem still runs. Install backend requirements
+to include `xlrd`, the reader required for `.xls` uploads.
+
+```bash
+curl -F "file=@cas_numbers.csv" localhost:8000/api/bulk-cas
+curl localhost:8000/api/bulk-cas/<job_id>
+curl -OJ localhost:8000/api/bulk-cas/<job_id>/download/xlsx
+curl -OJ localhost:8000/api/bulk-cas/<job_id>/download/csv
+
+cd backend
+pip install -r requirements-dev.txt
+python -m unittest test_common_chemistry test_bulk_cas -v
+```
 
 ## Spectral interpolation
 
@@ -198,6 +252,10 @@ structure the backend is about to use is not the structure that was asked for.
 
 ## Curating the unmatched
 
+CAS Common Chemistry verification runs during enrichment, before this pass.
+Its evidence is included for unmatched compounds even when PubChem returned no record.
+See [CAS Common Chemistry verification](#cas-common-chemistry-verification) for setup and verdicts.
+
 Nothing here tries to work out what a molecule is — ChemDraw already read the structure and
 PubChem was already searched every way it can be. The only question left, for the rows where
 those two disagreed or where PubChem returned nothing, is what the researcher should write
@@ -246,6 +304,65 @@ The second worksheet, **Unmatched - AI curated**, carries one row per unmatched 
 why it was unmatched (written locally, not by the model), the curator's verdict, its curated
 fields, and enough context from sheet 1 to read on its own.
 
+## CAS Common Chemistry verification
+
+The existing `Match?` (PubChem formula/weight) and `InChIKey Match?`
+(canonical ChemDraw SMILES vs canonical PubChem SMILES) keep their existing rules.
+CAS Common Chemistry adds an independent `CAS Verification` result during stage 3.
+Only the PubChem structural verdict determines which rows reach AI curation.
+
+Request a key from [CAS API access](https://www.cas.org/services/commonchemistry-api),
+then set it in `backend/.env` and restart the backend:
+
+```ini
+CAS_API_KEY=your-issued-key
+```
+
+The backend sends the key using `X-API-KEY`; it is never sent to the browser.
+Without it, rows report **Not configured** and processing continues.
+`CHEMDRAW_CAS_ENABLED=0` disables verification explicitly.
+
+The client searches the drawing's full InChIKey first, then tries PubChem's CAS
+annotations, the drawing's SMILES, and its caption. It inspects up to five unique
+CAS candidates per compound (`CHEMDRAW_CAS_MAX_CANDIDATES`, range 1–20), stopping
+on an exact structural match. Requests are paced at one per second and cached
+within each job. Access errors, rate limiting and network failures stop further
+network requests for that job and are reported as **Unavailable**.
+
+| CAS Verification | Meaning |
+|---|---|
+| Verified | CAS and ChemDraw have identical canonical isomeric SMILES, including stereochemistry |
+| Mismatch | The displayed CAS candidate has different canonical isomeric SMILES |
+| Not comparable | A usable structural representation is missing, or the candidate limit was reached without a comparable record |
+| Not found | No CAS record was retrieved for the available queries |
+| Unavailable | Access, network or response failure prevented completing verification |
+| Not configured / Disabled / Skipped | No API key, explicitly disabled, or no extracted structure |
+
+A name or CAS-number hit alone never verifies a structure. CAS's `canonicalSmile`
+can omit stereochemistry, so comparison uses its `smile` or a SMILES reconstructed
+from its InChI. Neither salts nor stereoisomers are collapsed. A mismatch concerns
+the displayed candidate, not every substance in CAS; truncated searches are noted.
+Records are kept intact without borrowing fields from different CAS RNs.
+
+The result, explanation, CAS RN, name, formula, molecular weight, SMILES, InChIKey
+and record link appear in **Compounds** and as context on **Unmatched - AI curated**.
+The results table shows the verdict and record link. The workbook's **Description**
+sheet documents the comparison and attribution. CAS fields remain distinct from
+the existing PubChem CAS annotations.
+
+```bash
+curl localhost:8000/api/cas           # configuration only; no external request
+curl localhost:8000/api/cas/selftest  # verify aspirin; requires CAS_API_KEY, no ChemDraw
+
+cd backend
+python -m unittest test_common_chemistry -v  # offline regression checks
+```
+
+Source: [CAS Common Chemistry](https://commonchemistry.cas.org/), CAS, a division
+of the American Chemical Society, [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/).
+See the [CAS API reference](https://commonchemistry.cas.org/api-overview).
+Names/formulas have HTML formatting removed; InChI may be converted to SMILES.
+
 ## Production
 
 Two services on the same host:
@@ -293,6 +410,9 @@ Frontend values follow the existing `frontend/.env.local` convention.
 | `CHEMDRAW_COPYAS_KEYS` | backend | `smiles=s,sln=l,…` | Menu mnemonics, if they differ in your build |
 | `CHEMDRAW_PUBCHEM_MAX_CANDIDATES` | backend | `25` | Candidate CIDs swept to fill missing fields |
 | `CHEMDRAW_PUBCHEM_MAX_REFERENCE` | backend | `5` | Candidates walked for CAS / synonyms / Wikipedia |
+| `CAS_API_KEY` | backend | *(unset)* | Enables CAS Common Chemistry verification |
+| `CHEMDRAW_CAS_ENABLED` | backend | `1` | `0` disables CAS verification |
+| `CHEMDRAW_CAS_MAX_CANDIDATES` | backend | `5` | CAS candidate records inspected per compound (1–20) |
 | `CHEMDRAW_INCHIKEY_DIR` | backend | `backend/data/inchikey` | Where `?save=true` writes structures |
 
 Neither `data/` directory is ever cleaned up — add a scheduled job to delete

@@ -7,16 +7,16 @@ The flow is deliberately linear, and there is exactly one path through it:
                 InChIKey and its MOL text.
   2. RDKit      reads ChemDraw's MOL text for the molecular formula and weight,
                 and canonicalises ChemDraw's SMILES.
-  3. PubChem    is queried with **ChemDraw's InChIKey** — that key and nothing
-                else. Every CID sharing that key is collected, and a field
-                missing from the first record is filled from the next one that
-                has it.
-  4. Two checks, and only two:
+  3. PubChem    is queried by ChemDraw's InChIKey first, then connectivity,
+                name and SMILES. Missing fields are filled across candidates.
+  4. Two PubChem checks:
 
         Match?           PubChem's formula equals the drawn formula, and its
                          weight agrees to within 0.5.
         InChIKey Match?  The canonical SMILES from ChemDraw and the canonical
                          SMILES from PubChem are identical.
+  5. CAS Common Chemistry independently verifies the drawing against a CAS
+                record, with its result and reference values kept separate.
 
 Both SMILES go through RDKit's canonical writer before being compared, because a
 SMILES string is one of many ways to write a structure — ChemDraw's and
@@ -39,6 +39,7 @@ from rdkit import Chem
 from rdkit.Chem import Descriptors
 
 import ai_curate
+import common_chemistry
 import pubchem
 from chemdraw_com import connect_chemdraw, export_formats_from_document, open_document
 from inchi_tools import (
@@ -85,6 +86,9 @@ ROW_COLUMNS = [
     # Reference data worth having beside them.
     "CAS no(s)", "IUPAC Name", "Synonym", "PubChem Link", "Wikipedia Link",
 
+    # Independent verification against CAS; the PubChem verdicts stay separate.
+    *common_chemistry.CAS_COLUMNS,
+
     # The researcher's own column, left empty on purpose.
     "Manual Match",
 ]
@@ -97,6 +101,7 @@ CURATED_COLUMNS = [
     "Discrepancy", "Likely Cause", "Recommended Action", "Curation Confidence",
     # Context, so the sheet reads on its own without cross-referencing sheet 1.
     "ChemDraw SMILES", "Formula", "PubChem CID", "PubChem Formula",
+    *common_chemistry.CAS_COLUMNS,
     "Curation Model", "Curation Error",
 ]
 
@@ -218,6 +223,8 @@ def _blank_row(name: str, suffix_tag: str) -> dict:
     row["Compound ID"] = suffix_tag
     row["Match?"] = MATCH_NO
     row["InChIKey Match?"] = MATCH_NA
+    row["CAS Verification"] = "Skipped"
+    row["CAS Verification Detail"] = "No structure was extracted for verification."
     row["Manual Match"] = None
     return row
 
@@ -360,7 +367,7 @@ def _why_unmatched(row: dict, hit) -> str:
 def _curated_row(row: dict, result: dict, reason: str) -> dict:
     curated = {col: None for col in CURATED_COLUMNS}
     for col in ("Compound Name", "Compound ID", "ChemDraw SMILES", "Formula",
-                "PubChem CID", "PubChem Formula"):
+                "PubChem CID", "PubChem Formula", *common_chemistry.CAS_COLUMNS):
         curated[col] = row.get(col)
     curated["Why Unmatched"] = reason
     curated["Curation Model"] = result.get("model")
@@ -419,6 +426,9 @@ def process_molecules(
 
     rows: list[dict] = []
     unmatched: list[tuple[int, dict, Any]] = []
+    cas_client = common_chemistry.CommonChemistryClient()
+    if not cas_client.config["ready"]:
+        emit({"type": "log", "level": "info", "message": cas_client.config["reason"]})
 
     # ── Pass 1: ChemDraw, RDKit, PubChem ──────────────────────────────────────
     for idx, cdxml_path in enumerate(cdxml_paths, 1):
@@ -445,20 +455,32 @@ def process_molecules(
 
             _fill_reference_fields(hit, row)
 
-            if symbol != MATCH_YES:
-                unmatched.append((idx, row, hit))
-
         except Exception as exc:
             # Reached only when ChemDraw itself could not be driven for this
             # molecule. Anything ChemDraw already returned is left in the row.
             emit({"type": "log", "level": "error",
                   "message": f"Failed {filename}: {exc}"})
+
+        # Verification also runs when PubChem found nothing or failed. All
+        # extracted ChemDraw values survive a CAS/network failure.
+        if row.get("ChemDraw SMILES") or row.get("ChemDraw InChIKey"):
+            try:
+                row.update(cas_client.verify(row, clean_name(name)))
+            except Exception:
+                row["CAS Verification"] = "Unavailable"
+                row["CAS Verification Detail"] = "CAS verification could not be completed."
+
+        if row["InChIKey Match?"] != MATCH_YES:
             unmatched.append((idx, row, hit))
 
         rows.append(row)
         emit({
             "type": "compound", "name": name,
             "match": row["Match?"], "inchikeyMatch": row["InChIKey Match?"],
+            "casVerification": row["CAS Verification"],
+            "casDetail": row["CAS Verification Detail"],
+            "casRn": row["CAS Common Chemistry RN"],
+            "casLink": row["CAS Common Chemistry Link"],
             "index": idx, "total": total,
         })
 

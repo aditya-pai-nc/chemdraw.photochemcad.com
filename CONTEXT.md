@@ -7,7 +7,8 @@ machine this runs on, and what is still open.
 `README.md` documents how to run the thing. This file is the reasoning behind it
 and the findings that are not recoverable from the code or the git history.
 
-Last updated: 2026-09-10. Nothing below is committed — see [Repository state](#repository-state).
+Last updated: 2026-09-14. Sections 1–11 describe the September 10 baseline;
+section 12 records the CAS Common Chemistry addition. Consult git for current repository state.
 
 ---
 
@@ -475,3 +476,185 @@ InChIKey and SMILES with a blank formula/weight, instead of an empty row. Run
 4. **`data/` grows forever.**
 5. **PubChem stored vs recomputed InChIKey** can disagree (see Chlorin e6).
 6. **Machine is unusable during a run** — ChemDraw takes focus per molecule.
+
+## 12. CAS Common Chemistry verification (2026-09-14)
+
+Requested as an additional verification source in the existing flow. The two
+PubChem checks retain their names, comparison rules and curation gate. Stage 3
+now also checks CAS after PubChem enrichment; it runs even if PubChem finds no
+record. CAS results and reference values have their own columns in Compounds and
+are copied as context to the curation sheet and evidence. SSE carries the verdict,
+explanation, CAS RN and link into the results table.
+
+`backend/common_chemistry.py` owns the client. It tries the full ChemDraw InChIKey,
+PubChem CAS annotations, the drawing's SMILES and the caption, with at most five
+candidate records by default. It never combines fields from separate CAS RNs.
+Verification compares canonical isomeric SMILES. CAS's `canonicalSmile` can omit
+stereochemistry; use `smile` or reconstruct from InChI. Missing structural data,
+no record and API failures are separate outcomes. Neither a name hit nor matching
+formula/weight can verify a compound. A mismatched candidate does not prove no
+matching CAS record exists; bounded or incomplete lookups are disclosed.
+
+CAS's public API returned HTTP 403 without credentials and explicitly required
+`X-API-KEY`. The user subsequently supplied a key, saved only in the ignored
+`backend/.env`. A live aspirin verification succeeded. `/api/cas` reports
+configuration; `/api/cas/selftest` checks aspirin without driving ChemDraw. Public
+API overview: https://commonchemistry.cas.org/api-overview .
+
+Offline regression checks in `backend/test_common_chemistry.py` cover exact and
+stereo comparisons, fallback routes, multiple candidates, missing data, access
+failures, caching, curation evidence, unchanged PubChem verdicts, SSE, and workbook
+export. A full ChemDraw desktop run remains unverified for this addition.
+
+## 13. Bulk CAS extractor
+
+Requested by Masahiko Taniguchi: upload roughly 100 CAS numbers in TXT/CSV/Excel,
+then retrieve formula, weight, SMILES, InChI and both database links. Implemented
+as `/bulk-cas`, a third tab alongside ChemDraw and interpolation. `bulk_cas.py`
+parses files and queries CAS/Common Chemistry and PubChem; `bulk_cas_jobs.py`
+owns background jobs, progress snapshots, cancellation and downloads. No desktop
+automation or AI is involved.
+
+Limits: 500 entries, 2 MB uploads, 10 queued/running batches, one batch at a time.
+Legacy XLS uses `xlrd`; XLSX uses `openpyxl`. Input order and duplicates remain;
+the extractor caches duplicate lookups. Invalid entries retain their own rows.
+Primary values come from the single CAS record when available, else PubChem.
+Independent source records and canonical isomeric SMILES agreement remain visible
+in row details and the exported workbook. Never merge fields across candidate
+substances. The CAS client now has `lookup_rn` for direct registry-number lookup.
+
+Completed snapshots and Excel/CSV files live in `backend/data/bulk_cas/<id>/`.
+Refresh restores the last batch, and completed snapshots survive server restarts.
+Stop finishes the in-flight lookup and exports partial results. Existing ChemDraw
+queue/state is untouched.
+
+Validation: 30 offline regression tests, including 100-row API upload, both Excel
+formats, checksum handling, duplicate caching, source selection, exports, saved
+snapshots and cancellation. Live CAS and PubChem lookups agreed for aspirin,
+caffeine and ethanol. Frontend type checking and production build passed.
+Browser verification covered a live five-entry upload (three distinct compounds,
+one invalid number, one duplicate), Excel download, both source detail panels,
+refresh recovery, the review filter, and desktop/mobile layouts. No browser errors
+were observed. A sample workbook is under
+`backend/data/bulk-cas-qa/professor-extractor-example.xlsx` (ignored test output).
+
+---
+
+## 14. Deployment: Vercel + AWS Lightsail
+
+Added 2026-09-20.
+
+The production split is **Vercel (Next UI + `/api` proxy) → public internet →
+AWS Lightsail Windows instance (FastAPI + ChemDraw + `data/jobs/`)**.
+
+The backend cannot live on Vercel: it is Linux serverless, with no COM, no
+ChemDraw, a read-only filesystem, and function durations measured in seconds
+against a pipeline that runs for minutes per file. Only the frontend goes there.
+
+### 14.1 Authentication is now required for that topology
+
+The original security model was one sentence — *FastAPI binds to 127.0.0.1 and
+is never reachable from the internet*. Proxying from Vercel breaks that
+assumption and leaves every endpoint open to anyone who finds the address:
+upload a `.cdx` and drive ChemDraw on the instance, download other jobs'
+output, enumerate the queue, spend the Anthropic key through curation.
+
+`CHEMDRAW_API_TOKEN` on **both** sides:
+
+- Backend (`app.py`) — a middleware requiring `x-chemdraw-token` (or
+  `Authorization: Bearer`), compared with `secrets.compare_digest`. Unset means
+  disabled, so a localhost-only development setup is unchanged.
+- Frontend (`app/api/[...path]/route.ts`) — injected **server-side**. Never
+  `NEXT_PUBLIC_`; a token the browser can send is a token the browser can read.
+
+`/api/health` is exempt and reports `auth_required`, so a deployment cannot be
+open without saying so. A 401 through the proxy is rewritten to name the actual
+cause — a missing or mismatched token — rather than surfacing a bare status.
+
+### 14.2 Keystrokes cannot work on a cloud instance
+
+`Edit > Copy As` needs a visible window, foreground focus, and an **active**
+interactive session. On an RDP box the session goes to `Disc` the moment you
+disconnect: `keybd_event` reports nothing, the clipboard simply never changes,
+and the caller waits out its timeout for every format of every compound —
+roughly **15 seconds per molecule** proving something knowable once.
+
+`chemdraw_keys.can_send_input()` now calls `OpenInputDesktop()`, which succeeds
+only for a process attached to the window station that owns user input. It fails
+on a locked workstation, a disconnected RDP session, and in session 0. The
+result is cached for `CHEMDRAW_KEYS_RECHECK` seconds (default 30) so that
+reconnecting RDP restores the keystroke route without a restart.
+
+Measured: with no input desktop, all four formats fall through to COM in
+**1.3s** per molecule instead of ~15s. The same build therefore uses keystrokes
+on an interactive desktop and COM-only on Lightsail, with no configuration.
+
+`CHEMDRAW_KEYS_FALLBACK=0` still forces COM-only explicitly if wanted.
+
+### 14.3 ChemDraw on the instance — unresolved
+
+`/api/chemdraw` on the Lightsail box returns:
+
+| ProgID | HRESULT | Meaning |
+|---|---|---|
+| `ChemDraw.Application`, `.40`, `.39`, `ChemOffice.ChemDrawApp` | `0x800401F3` `CO_E_CLASSSTRING` | not registered on that host |
+| `ChemDraw_x64.Application` | `0x80080005` `CO_E_SERVER_EXEC_FAILURE` | registered, but the exe would not launch |
+
+On the dev box (Windows 11, build 22631) **both** are registered in HKLM and
+`ChemDraw.Application` connects. The half-state on Lightsail points at a partial
+install, an unfinished activation, or a service running in session 0. Check
+there, in the account uvicorn runs as:
+
+```powershell
+reg query "HKLM\SOFTWARE\Classes\ChemDraw_x64.Application\CLSID"
+reg query "HKCR\CLSID\{guid}\LocalServer32"   # does that exe exist?
+query session                                     # session 0 means no desktop
+```
+
+Also worth confirming the ChemDraw licence permits a cloud VM at all.
+
+### 14.4 Expect Vercel to cut the SSE stream
+
+Vercel serverless functions have a hard maximum duration, and
+`/api/jobs/{id}/events` is a long-lived stream while a job runs for minutes. The
+`proxyTimeout: 30min` in `next.config.mjs` applies to `next start`, not Vercel's
+runtime. The EventSource `Last-Event-ID` resume logic will partly mask this;
+long uploads through the same path are likelier to fail outright. Not yet
+addressed — it only becomes visible once ChemDraw starts on the instance.
+
+### 14.5 `deploy-windows.ps1`
+
+One script at the repo root does the whole box: venv, dependencies, pywin32 COM
+registration, API token, autostart, firewall, then a verification pass that
+queries `/api/chemdraw` rather than assuming it works.
+
+```powershell
+.\deploy-windows.ps1                        # local, loopback, ChemDraw works
+.\deploy-windows.ps1 -BindHost 0.0.0.0      # reachable from Vercel; prints a generated token
+.\deploy-windows.ps1 -BindHost 0.0.0.0 -WithFrontend
+.\deploy-windows.ps1 -Mode Service          # no ChemDraw; warns loudly
+```
+
+**It installs a Scheduled Task at logon, not a Windows Service, and that is the
+whole point.** A service runs in session 0 with no desktop, so COM cannot launch
+ChemDraw and the pipeline dies with `CO_E_SERVER_EXEC_FAILURE`. An earlier
+NSSM-based install script was the direct cause of the failure in 14.3. `-Mode
+Service` is still available for the interpolation and CAS halves, which need no
+ChemDraw, and it sets `CHEMDRAW_KEYS_FALLBACK=0` since there is no desktop.
+
+The machine must stay logged in. On a cloud instance, connect once over RDP and
+leave the session connected — signing out ends the desktop the task runs in.
+
+Other behaviour worth knowing:
+
+- Removes any previous service *and* task before installing, and kills a stale
+  listener on the port, so the two installation modes can never fight.
+- Generates `CHEMDRAW_API_TOKEN` automatically whenever `-BindHost` is not
+  loopback, reusing one already in `backend/.env` if present, and writes the
+  matching value to `frontend/.env.local` under `-WithFrontend`.
+- Refuses to run unelevated; fails on an `import app` error before installing
+  autostart, so a broken deploy surfaces immediately rather than at next boot.
+- Tested: parse-clean, admin guard fires, `Set-EnvValue` handles commented keys,
+  absent keys, repeat runs, empty files and similar key names without
+  corruption; the task builds with `LogonType=Interactive`,
+  `ExecutionTimeLimit=PT0S`, `MultipleInstances=IgnoreNew`.

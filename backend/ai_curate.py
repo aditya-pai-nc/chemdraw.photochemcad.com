@@ -256,14 +256,15 @@ def _ask_json(*, system: str, content: list, schema: dict, max_tokens: int = 400
 
 CURATE_SYSTEM = """You are curating one compound that a chemistry pipeline could not confirm automatically.
 
-ChemDraw read a structure off a drawing and produced its InChIKey. PubChem was queried with that key. This compound reached you because the canonical SMILES from ChemDraw and the canonical SMILES from PubChem are NOT identical — or because PubChem had no record for that key at all.
+ChemDraw read a structure off a drawing and produced its InChIKey. PubChem was searched by that key, then connectivity, name and SMILES as needed. This compound reached you because the canonical SMILES from ChemDraw and PubChem differ or could not be compared, or because the lookup returned no record.
 
-Your job is not to identify the molecule from scratch. It is to reconcile what the two sources said and tell the researcher what to record.
+Your job is not to identify the molecule from scratch. It is to reconcile the supplied ChemDraw, PubChem and CAS Common Chemistry evidence and tell the researcher what to record.
 
 How to weigh what you are given:
 - CHEMDRAW is ground truth for *what is on the page*. It is not proof the chemist drew the right thing, but it is exactly what was drawn.
 - The molecular formula is the cheapest hard check. If PubChem's formula differs from the drawn formula, PubChem has returned a different compound, however plausible its name looks.
-- PubChem was found by exact InChIKey, so the record genuinely shares that structure hash. When the canonical SMILES still differ, the usual causes are a salt or charged form, a tautomer written differently, or one side defining a stereocentre the other left flat. Say which.
+- Check PubChem's lookup_route: a skeleton, name or SMILES fallback does not guarantee an exact InChIKey hit. When canonical SMILES differ, inspect salt or charged forms, tautomers and stereochemistry. Say which difference the evidence supports.
+- CAS Common Chemistry is an independent reference when a record is supplied. Its verification compares canonical isomeric SMILES to the drawing. A CAS name or registry number hit alone is not proof of identity. Unavailable, not configured, not found or not comparable results provide no structural verdict. CAS agreement does not imply that a different PubChem candidate is correct.
 - One InChIKey can resolve to several deposited records. Where several CIDs are listed, say which one the researcher should trust.
 - If PubChem returned nothing, the drawn structure may simply not be deposited — that is a finding, not an error. Do not invent a CID to fill the gap.
 
@@ -387,11 +388,23 @@ def build_evidence(row: dict[str, Any], hit) -> dict[str, Any]:
         },
     }
 
+    evidence["cas_common_chemistry"] = {
+        "verification": row.get("CAS Verification"),
+        "detail": row.get("CAS Verification Detail"),
+        "rn": row.get("CAS Common Chemistry RN"),
+        "name": row.get("CAS Common Chemistry Name"),
+        "molecular_formula": row.get("CAS Common Chemistry Formula"),
+        "molecular_weight": row.get("CAS Common Chemistry Molecular Weight"),
+        "smiles": row.get("CAS Common Chemistry SMILES"),
+        "inchikey": row.get("CAS Common Chemistry InChIKey"),
+        "url": row.get("CAS Common Chemistry Link"),
+    }
+
     if hit is None:
         evidence["pubchem"] = {
             "found": False,
             "searched_inchikey": row.get("ChemDraw InChIKey"),
-            "note": "PubChem holds no compound with this InChIKey.",
+            "note": "PubChem lookup returned no record for the available queries.",
         }
         return evidence
 
@@ -399,7 +412,8 @@ def build_evidence(row: dict[str, Any], hit) -> dict[str, Any]:
         "found": True,
         "searched_inchikey": row.get("ChemDraw InChIKey"),
         "cid": hit.cid,
-        "all_cids_sharing_this_inchikey": hit.candidate_cids[:10],
+        "lookup_route": hit.source,
+        "candidate_cids": hit.candidate_cids[:10],
         "title": hit.title,
         "iupac_name": row.get("IUPAC Name") or hit.iupac_name,
         "molecular_formula": hit.formula,

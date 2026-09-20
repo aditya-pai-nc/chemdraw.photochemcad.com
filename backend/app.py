@@ -7,12 +7,13 @@ from __future__ import annotations
 import io
 import json
 import os
+import secrets
 import zipfile
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -22,10 +23,12 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 import config  # noqa: F401  (imported for its side effect)
 
 import ai_curate
+import common_chemistry
 import pubchem
 from inchi_tools import normalize_inchikey
 from interpolation_jobs import InterpolationManager
 from jobs import JobManager, QueueFullError, check_chemdraw
+from bulk_cas_jobs import router as bulk_cas_router
 
 manager = JobManager()
 interpolation_manager = InterpolationManager()
@@ -37,6 +40,7 @@ INCHIKEY_DIR = Path(
 INCHIKEY_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="ChemDraw Processor", version="1.0.0")
+app.include_router(bulk_cas_router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -46,14 +50,75 @@ app.add_middleware(
 )
 
 
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+# The original security model was one sentence: FastAPI binds to 127.0.0.1 and
+# is never reachable from the internet. That holds when Next and uvicorn sit on
+# the same host. It does not hold when the UI is served from elsewhere — Vercel,
+# say — and proxies across the public internet to a Windows box, which leaves
+# every endpoint open: upload a .cdx and drive ChemDraw on that machine, read
+# any job's output, spend the Anthropic key through the curation pass.
+#
+# So: a shared secret, injected by the Next proxy server-side and required here.
+# The browser never sees it. Unset means disabled, which keeps a localhost-only
+# development setup working exactly as before — but `/api/health` reports which
+# way it is configured, so a deployment cannot be open without saying so.
+
+API_TOKEN = (os.environ.get("CHEMDRAW_API_TOKEN") or "").strip()
+AUTH_HEADER = "x-chemdraw-token"
+
+# Open regardless: a health check has to work for whatever is watching the
+# service, and it discloses nothing beyond the fact that the process is up.
+AUTH_EXEMPT_PATHS = {"/api/health"}
+
+
+@app.middleware("http")
+async def require_token(request: Request, call_next):
+    if not API_TOKEN:
+        return await call_next(request)
+
+    path = request.url.path
+    # Only the API is protected. The static UI mount below is not secret, and
+    # CORS preflights carry no headers to check.
+    if not path.startswith("/api/") or path in AUTH_EXEMPT_PATHS or request.method == "OPTIONS":
+        return await call_next(request)
+
+    supplied = request.headers.get(AUTH_HEADER) or ""
+    if not supplied:
+        header = request.headers.get("authorization") or ""
+        if header.lower().startswith("bearer "):
+            supplied = header[7:].strip()
+
+    # compare_digest so a wrong token cannot be narrowed down by timing.
+    if not secrets.compare_digest(supplied, API_TOKEN):
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Missing or invalid API token."},
+        )
+
+    return await call_next(request)
+
+
 @app.get("/api/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok"}
+async def health() -> dict[str, str | bool]:
+    return {"status": "ok", "auth_required": bool(API_TOKEN)}
 
 
 @app.get("/api/chemdraw")
 async def chemdraw_status() -> dict:
     return await check_chemdraw()
+
+
+@app.get("/api/cas")
+async def cas_status() -> dict:
+    return common_chemistry.status()
+
+
+@app.get("/api/cas/selftest")
+async def cas_selftest() -> dict:
+    """Verify aspirin against CAS Common Chemistry without driving ChemDraw."""
+    return await run_in_threadpool(common_chemistry.selftest)
 
 
 @app.get("/api/queue")

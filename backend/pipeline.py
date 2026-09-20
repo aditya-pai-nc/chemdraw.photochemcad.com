@@ -70,9 +70,35 @@ DESCRIPTION_ROWS: list[tuple[str, str]] = [
     ("Manual Match", "Left empty on purpose - your own verdict."),
     ("", ""),
 
+    ("CAS COMMON CHEMISTRY VERIFICATION", ""),
+    ("CAS Verification",
+     "An independent comparison against CAS Common Chemistry. The drawing's InChIKey is "
+     "searched first, followed by CAS numbers reported by PubChem, the drawing's SMILES and "
+     "its caption. Candidate records are bounded; a name or CAS number hit alone is not "
+     "verification. Verified means CAS and ChemDraw have identical canonical isomeric "
+     "SMILES, including stereochemistry. Mismatch describes the displayed CAS candidate; "
+     "it is not a claim that no matching substance exists. These results do not change the "
+     "two PubChem checks or which compounds go to curation."),
+    ("CAS Verification Detail",
+     "Records how the candidate was found and why it was verified, mismatched or not "
+     "comparable. Not found means no record was retrieved, not that the drawing is wrong. "
+     "Unavailable, Not configured, Disabled and Skipped do not count as mismatches. "
+     "A candidate limit or incomplete lookup is reported explicitly."),
+    ("CAS reference fields",
+     "RN, name, formula, molecular weight, SMILES, InChIKey and link belong to one CAS "
+     "record; they are not borrowed across substances. SMILES uses CAS's stereo-preserving "
+     "representation or is reconstructed from its InChI. CAS's connectivity-only canonical "
+     "SMILES is not used to verify stereochemistry. Formula and weight are reference data."),
+    ("CAS attribution",
+     "Source: CAS Common Chemistry, CAS, a division of the American Chemical Society. "
+     "https://commonchemistry.cas.org/ . Each record is linked in CAS Common Chemistry Link. "
+     "Licensed under CC BY-NC 4.0: https://creativecommons.org/licenses/by-nc/4.0/ . "
+     "HTML formatting is removed from names/formulas; InChI may be converted to SMILES."),
+    ("", ""),
+
     ("Sheet 2 - Unmatched - AI curated",
      "Every compound whose InChIKey Match? is not a tick. A small AI model is given the "
-     "ChemDraw data and the PubChem data and asked to reconcile them: what differs, why, and "
+     "ChemDraw data, PubChem data and available CAS verification and asked to reconcile them: what differs, why, and "
      "what to record. It may only quote an InChIKey that already appears in the evidence; "
      "anything else it proposes is discarded and noted in 'Curation Error'. Nothing on that "
      "sheet is used to change sheet 1."),
@@ -173,7 +199,7 @@ def run_full_pipeline(cdx_path: str, output_dir: str, emit: Callable) -> None:
         "type": "stage", "stage": 3, "total": stage_total,
         "message": (
             f"Processing {len(mol_paths)} compound(s): ChemDraw structures, "
-            "then PubChem by InChIKey…"
+            "then PubChem by InChIKey and CAS Common Chemistry verification…"
         ),
     })
 
@@ -231,5 +257,6 @@ def run_full_pipeline(cdx_path: str, output_dir: str, emit: Callable) -> None:
         # keeping both.
         "matchCount": tally("Match?", "✅"),
         "inchikeyMatchCount": tally("InChIKey Match?", "✅"),
+        "casVerifiedCount": tally("CAS Verification", "Verified"),
         "curatedCount": len(curated_rows),
     })

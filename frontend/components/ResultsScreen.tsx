@@ -4,6 +4,7 @@ import type { JSX } from 'react'
 import { FileSpreadsheet, FolderArchive, RotateCcw, CheckCircle2, XCircle, AlertCircle, MinusCircle } from 'lucide-react'
 import type { CompoundRow, MatchSymbol } from '@/lib/types'
 import { archiveUrl, excelUrl } from '@/lib/api'
+import { CasVerification } from './CasVerification'
 
 /** One verdict cell: agree, disagree, or nothing to compare. */
 function Verdict({ value }: { value: MatchSymbol }): JSX.Element {
@@ -57,6 +58,8 @@ export function ResultsScreen({
   const formulaMatched = compounds.filter((c) => c.match === '✅').length
   const matched = compounds.filter((c) => c.inchikeyMatch === '✅').length
   const unmatched = total - matched
+  const casVerified = compounds.filter((c) => c.casVerification === 'Verified').length
+  const casCompared = compounds.filter((c) => c.casVerification === 'Verified' || c.casVerification === 'Mismatch').length
   const curated = compounds.filter((c) => c.curated).length
   // Of the curated ones, how many the model still judged to be the same
   // compound — a salt form or a tautomer is the usual reason.
@@ -88,7 +91,7 @@ export function ResultsScreen({
       )}
 
       {total > 0 && (
-        <div className="grid grid-cols-4 gap-3 shrink-0">
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-3 shrink-0">
           <div className="rounded-xl bg-slate-900 border border-slate-800 px-4 py-3 text-center">
             <p className="text-2xl font-bold text-white">{total}</p>
             <p className="text-xs text-slate-500 mt-0.5">Compounds</p>
@@ -102,6 +105,11 @@ export function ResultsScreen({
             <p className="text-2xl font-bold text-emerald-400">{matched}</p>
             <p className="text-xs text-emerald-600 mt-0.5">InChIKey match</p>
             <p className="text-[10px] text-slate-600">{rate(matched)}%</p>
+          </div>
+          <div className="rounded-xl bg-slate-900 border border-slate-800 px-4 py-3 text-center">
+            <p className="text-2xl font-bold text-emerald-400">{casCompared > 0 ? casVerified : '—'}</p>
+            <p className="text-xs text-slate-500 mt-0.5">CAS verified</p>
+            <p className="text-[10px] text-slate-600">{casCompared > 0 ? `of ${casCompared} compared` : 'No comparable results'}</p>
           </div>
           <div className="rounded-xl bg-violet-900/20 border border-violet-800/40 px-4 py-3 text-center">
             <p className="text-2xl font-bold text-violet-300">{curated > 0 ? curated : '—'}</p>
@@ -175,7 +183,7 @@ export function ResultsScreen({
               Curated rows are on the workbook&apos;s second sheet
             </span>
           </div>
-          <div className="overflow-y-auto max-h-72">
+          <div className="overflow-auto max-h-72">
             <table className="w-full text-xs">
               <thead className="sticky top-0 bg-slate-900/90 backdrop-blur-sm">
                 <tr>
@@ -183,6 +191,7 @@ export function ResultsScreen({
                   <th className="text-left px-4 py-2 text-slate-500 font-medium">Compound Name</th>
                   <th className="text-center px-3 py-2 text-slate-500 font-medium w-20" title="PubChem formula and weight">Formula</th>
                   <th className="text-center px-3 py-2 text-slate-500 font-medium w-20" title="Canonical SMILES from ChemDraw vs from PubChem">InChIKey Match</th>
+                  <th className="text-center px-3 py-2 text-slate-500 font-medium w-28" title="Independent structure verification against CAS Common Chemistry">CAS Common Chemistry</th>
                   <th className="text-center px-3 py-2 text-slate-500 font-medium w-24" title="Curator's verdict for compounds that did not match exactly">Curated</th>
                 </tr>
               </thead>
@@ -193,6 +202,7 @@ export function ResultsScreen({
                     <td className="px-4 py-2 text-slate-300 font-medium">{c.name}</td>
                     <td className="px-3 py-2"><Verdict value={c.match} /></td>
                     <td className="px-3 py-2"><Verdict value={c.inchikeyMatch} /></td>
+                    <td className="px-3 py-2"><CasVerification result={c} /></td>
                     <td className="px-3 py-2"><Curated verdict={c.curated} matched={c.inchikeyMatch === '✅'} /></td>
                   </tr>
                 ))}
@@ -200,6 +210,14 @@ export function ResultsScreen({
             </table>
           </div>
         </div>
+      )}
+      {compounds.some((c) => c.casRn) && (
+        <p className="text-[10px] text-slate-500 shrink-0">
+          CAS data: <a href="https://commonchemistry.cas.org/" target="_blank" rel="noopener noreferrer" className="underline">CAS Common Chemistry</a>,
+          {' '}CAS, a division of the American Chemical Society.{' '}
+          <a href="https://creativecommons.org/licenses/by-nc/4.0/" target="_blank" rel="noopener noreferrer" className="underline">CC BY-NC 4.0</a>.
+          {' '}Comparison details and reference values are included in the workbook.
+        </p>
       )}
     </div>
   )

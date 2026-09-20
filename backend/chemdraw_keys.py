@@ -80,10 +80,47 @@ def copy_as_keys() -> dict[str, str]:
     return keys
 
 
+def can_send_input() -> tuple[bool, Optional[str]]:
+    """
+    Can this process actually deliver synthetic keystrokes right now?
+
+    `OpenInputDesktop` succeeds only for a process attached to the window
+    station that currently owns user input. It fails on a locked workstation, on
+    a disconnected RDP session, and in Session 0 where a service runs with no
+    desktop at all.
+
+    This matters because the failure mode otherwise is silent. `keybd_event`
+    reports nothing when there is no desktop to receive the input — the
+    clipboard simply never changes, and the caller waits out its timeout for
+    every format of every compound before giving up. On a cloud Windows
+    instance, which is exactly where this pipeline gets deployed, that is
+    roughly fifteen seconds per molecule spent proving something that could
+    have been established once.
+    """
+    import ctypes
+
+    MAXIMUM_ALLOWED = 0x02000000
+    try:
+        user32 = ctypes.windll.user32
+        hdesk = user32.OpenInputDesktop(0, False, MAXIMUM_ALLOWED)
+        if not hdesk:
+            err = ctypes.get_last_error() if hasattr(ctypes, "get_last_error") else None
+            return False, (
+                "No interactive input desktop is available (locked workstation, "
+                "disconnected RDP session, or a service in session 0)"
+                + (f" [error {err}]" if err else "")
+                + ". COM is used instead."
+            )
+        user32.CloseDesktop(hdesk)
+        return True, None
+    except Exception as exc:
+        return False, f"Could not check for an input desktop: {exc}"
+
+
 def availability() -> tuple[bool, Optional[str]]:
     """(usable, reason it is not) for the keystroke route."""
     if not ENABLED:
-        return False, "Keystroke fallback is disabled (CHEMDRAW_KEYS_FALLBACK=0)."
+        return False, "Keystroke route is disabled (CHEMDRAW_KEYS_FALLBACK=0)."
     if sys.platform != "win32":
         return False, f"Keystroke automation needs Windows; this is {sys.platform}."
     try:
@@ -92,8 +129,29 @@ def availability() -> tuple[bool, Optional[str]]:
         import win32gui  # noqa: F401
         import win32process  # noqa: F401
     except ImportError as exc:
-        return False, f"pywin32 is required for the keystroke fallback ({exc})."
-    return True, None
+        return False, f"pywin32 is required for the keystroke route ({exc})."
+
+    # Checked last, and cached, because it is the only one that can change while
+    # the server is running — someone locks the machine, or an RDP session is
+    # disconnected — and the answer decides whether a whole run wastes minutes.
+    return _cached_input_desktop()
+
+
+# The input-desktop check costs a syscall, and the extraction path asks once per
+# molecule. Re-checked periodically rather than cached forever so that
+# reconnecting an RDP session restores the keystroke route without a restart.
+_INPUT_RECHECK_SECONDS = float(os.environ.get("CHEMDRAW_KEYS_RECHECK", "30"))
+_input_state: tuple[float, bool, Optional[str]] | None = None
+
+
+def _cached_input_desktop() -> tuple[bool, Optional[str]]:
+    global _input_state
+    now = time.time()
+    if _input_state is not None and (now - _input_state[0]) < _INPUT_RECHECK_SECONDS:
+        return _input_state[1], _input_state[2]
+    ok, reason = can_send_input()
+    _input_state = (now, ok, reason)
+    return ok, reason
 
 
 # ---------------------------------------------------------------------------

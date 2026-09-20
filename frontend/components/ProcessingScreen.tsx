@@ -8,7 +8,7 @@ import type { StreamStatus } from '@/lib/api'
 const STAGE_LABELS = [
   { label: 'CDX → CDXML', desc: 'Opening ChemDraw and converting file' },
   { label: 'Split Molecules', desc: 'Extracting individual structures' },
-  { label: 'Gather & Enrich', desc: 'ChemDraw formats, RDKit, PubChem' },
+  { label: 'Gather & Verify', desc: 'ChemDraw, RDKit, PubChem, CAS Common Chemistry' },
   { label: 'Curate Unmatched', desc: 'Reconciling compounds that did not match' }
 ]
 

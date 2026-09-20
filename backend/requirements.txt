@@ -3,6 +3,7 @@ uvicorn[standard]>=0.30.0
 python-multipart>=0.0.9
 pandas
 openpyxl
+xlrd>=2.0.1
 requests
 rdkit
 periodictable
